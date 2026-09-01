@@ -326,6 +326,14 @@ def _parse_count(v: str) -> int:
 # ---------------------------------------------------------------------------
 
 _PROFILE_NAME_JS = """() => {
+    const _parseCount = (v) => {
+        const s = (v || '').replace(/,/g, '').trim().toUpperCase();
+        const m = s.match(/^([0-9.]+)([KMB]?)$/);
+        if (!m) return 0;
+        const n = parseFloat(m[1]); if (isNaN(n)) return 0;
+        const mult = {'':1,'K':1000,'M':1000000,'B':1000000000}[m[2]];
+        return Math.floor(n * mult);
+    };
     const out = {name:'', handle:'', bio:'', location:'', website:'', followers:0, following:0, posts:0, verified:false};
     const n = document.querySelector('[data-testid="UserName"]');
     if (n) {
