@@ -660,7 +660,8 @@ class XAgentApp(tk.Tk):
             try:
                 groups = self._sweep_read(sess)
                 sess.close()
-                self.after(0, lambda g=groups: self._sweep_show(g))
+                previews = self._sweep_preview(groups)
+                self.after(0, lambda g=groups, p=previews: self._sweep_show(g, p))
             except Exception as exc:
                 _dbg(f"run_sweep FAILED: {type(exc).__name__}: {exc}")
                 try:
@@ -742,10 +743,12 @@ class XAgentApp(tk.Tk):
                 previews.append({"stage": stage, "user": r, "text": text})
         return previews
 
-    def _sweep_show(self, groups: dict[str, list]) -> None:
+    def _sweep_show(self, groups: dict[str, list], previews: list[dict] | None = None) -> None:
         _dbg("_sweep_show opening review window")
         self._sweep_running = False
         self._set_busy(False, "Sweep done. Review the rows and 'Type into composer' per person.")
+        if previews is None:
+            previews = self._sweep_preview(groups)
 
         win = tk.Toplevel(self)
         win.title("Sweep result — semi-auto steps")
