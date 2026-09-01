@@ -170,7 +170,7 @@ def reset_db() -> None:
 
 def add_user(username: str, source: str = "manual") -> int:
     """Insert (or re-activate) a user by handle if they are not already tracked."""
-    username = username.strip().lstrip("@").strip()
+    username = username.strip().lstrip("@").strip().lower()
     if not username:
         raise ValueError("Username cannot be empty")
     now = utc_now()
@@ -191,7 +191,7 @@ def upsert_user(data: dict[str, Any]) -> int:
     'username' is the unique key. Missing rows are inserted as discovered and
     prefilled from the API; existing rows get their public data refreshed.
     """
-    username = str(data.get("username") or "").strip().lstrip("@").strip()
+    username = str(data.get("username") or "").strip().lstrip("@").strip().lower()
     if not username:
         raise ValueError("User dict must include a username")
     now = utc_now()
@@ -238,7 +238,7 @@ def get_user(user_id: int):
 
 
 def get_user_by_handle(username: str):
-    username = username.strip().lstrip("@")
+    username = username.strip().lstrip("@").lower()
     with connect() as db:
         return db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
 

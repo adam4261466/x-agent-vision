@@ -459,6 +459,14 @@ _SCROLL_TIMELINE_JS = """() => {
 
 
 _TWEET_EXTRACT_JS = """() => {
+    const _parseCount = (v) => {
+        const s = (v || '').replace(/,/g, '').trim().toUpperCase();
+        const m = s.match(/^([0-9.]+)([KMB]?)$/);
+        if (!m) return 0;
+        const n = parseFloat(m[1]); if (isNaN(n)) return 0;
+        const mult = {'':1,'K':1000,'M':1000000,'B':1000000000}[m[2]];
+        return Math.floor(n * mult);
+    };
     const rows = Array.from(document.querySelectorAll('[data-testid="tweet"]'));
     const out = [];
     for (const row of rows) {
@@ -685,6 +693,7 @@ _READ_MESSAGES_JS = """() => {
 def _open_thread(context, page: Any, handle: str, timeout_ms: int) -> Any:
     """Open the DM conversation with @handle from the inbox and verify it is
     really theirs. Returns the opened thread page or raises a clear error."""
+    handle = str(handle).strip().lstrip("@").lower()
     _goto(page, "https://x.com/messages",
           wait_selector='[data-testid="conversation"], [data-testid="messageEntry"]', timeout_ms=timeout_ms)
     try:
