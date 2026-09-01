@@ -1,0 +1,2 @@
+# No third-party packages required: urllib, hmac, tkinter, sqlite3 (stdlib).
+# Ollama must run locally for message generation.
