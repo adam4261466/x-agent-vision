@@ -22,6 +22,7 @@ human approves into the composer, and never hits send.
 from __future__ import annotations
 
 import os
+import random
 import re
 import subprocess
 import sys
@@ -139,6 +140,58 @@ def _ensure_chrome() -> str | None:
     return err
 
 
+# ---------------------------------------------------------------------------
+# Human-like pacing: random pauses, jitter scrolling, variable typing. The X
+# web app and its rate limits look at real human behavior, so no two actions
+# take the same amount of time.
+# ---------------------------------------------------------------------------
+
+def _human_pause(lo_ms: float, hi_ms: float) -> None:
+    """Sleep a random human-like pause between lo_ms and hi_ms."""
+    time.sleep(random.uniform(lo_ms, hi_ms) / 1000.0)
+
+
+def _human_wait(page: Any, lo_ms: float, hi_ms: float) -> None:
+    """Page-level wait with a random duration (mimics a human reading pause)."""
+    page.wait_for_timeout(random.uniform(lo_ms, hi_ms))
+
+
+_SCROLL_JITTER_JS = """() => {
+    const dir = Math.random() < 0.5 ? -1 : 1;
+    const amt = 120 + Math.random() * 420;
+    window.scrollBy(0, dir * amt);
+    return true;
+}"""
+
+
+def _jitter_scroll(page: Any) -> None:
+    """Small random scroll nudges (up/down a little) to look like a person
+    skimming the page, with a short random pause after."""
+    try:
+        page.evaluate(_SCROLL_JITTER_JS)
+        page.evaluate(_SCROLL_JITTER_JS)
+    except Exception:
+        pass
+    _human_wait(page, 250, 800)
+
+
+def _type_human(page: Any, text: str) -> None:
+    """Type like a person: most keystrokes 25-120ms apart, an occasional
+    'thinking' pause mid-message, and a longer pause before the final burst.
+    Randomness means the same draft is never typed at the same speed twice."""
+    n = len(text)
+    for i, ch in enumerate(text):
+        page.keyboard.type(ch, delay=0)
+        if random.random() < 0.10:
+            _human_pause(250, 700)          # human pause before a burst
+        elif i == n - 1:
+            _human_pause(180, 450)          # trailing pause before send
+        else:
+            _human_pause(22, 130)
+        if (i + 1) % 4 == 0 and random.random() < 0.5:
+            _jitter_scroll(page)
+
+
 def _connect_sync():
     """Connect via CDP and return a (sync_playwright, browser, context) tuple."""
     err = _ensure_chrome()
@@ -236,6 +289,7 @@ def _goto(page: Any, url: str, wait_selector: str | None = None, timeout_ms: int
             page.wait_for_selector(wait_selector, timeout=wait_timeout_ms)
         except PlaywrightError:
             pass
+    _human_wait(page, 500, 1500)   # random settle after every navigation
     _require_login(page)
     _hard_error(page, url)
 
@@ -325,7 +379,7 @@ def _profile_fetch(page: Any, handle: str, timeout_ms: int) -> dict[str, Any]:
         page.wait_for_selector('[data-testid="UserName"]', timeout=10000)
     except PlaywrightError:
         pass
-    page.wait_for_timeout(600)
+    _human_wait(page, 500, 1500)
     out = page.evaluate(_PROFILE_NAME_JS) or {}
     # Fallback: name from the page title ("@handle (Display Name) / X").
     if not out.get("name"):
@@ -463,7 +517,8 @@ def fetch_user_posts_page(handle: str, count: int = 25, scroll_rounds: int = 2,
                     page.evaluate(_SCROLL_TIMELINE_JS)
                 except Exception:
                     pass
-                page.wait_for_timeout(1400)
+                _human_wait(page, 900, 2200)   # 'absorb' the new posts
+                _jitter_scroll(page)
                 rows = page.evaluate(_TWEET_EXTRACT_JS) or []
                 for r in rows:
                     key = r.get("post_id") or r.get("text")[:80]
@@ -523,7 +578,8 @@ def search_recent_users(query: str, count: int = 40, scroll_rounds: int = 3,
                         timeout_ms: int = 40000,
                         session: BrowserSession | None = None) -> list[dict[str, Any]]:
     """Search recent tweets on x.com and return the unique author handles with
-    their display names. Profile details come later via fetch_profile_page."""
+    their display names, at a human reading pace (variable scroll pauses, no
+    bulk scanning). Profile details come later via fetch_profile_page."""
     _dbg(f"search_recent_users START query={query!r} count={count}")
     with _BROWSER_LOCK:
         pw = browser = context = None
@@ -550,7 +606,8 @@ def search_recent_users(query: str, count: int = 40, scroll_rounds: int = 3,
                     page.evaluate(_SCROLL_TIMELINE_JS)
                 except Exception:
                     pass
-                page.wait_for_timeout(1500)
+                _human_wait(page, 1000, 2400)
+                _jitter_scroll(page)
                 for u in page.evaluate(_SEARCH_AUTHORS_JS) or []:
                     h = (u.get("username") or "").lower()
                     if h and h not in seen:
@@ -636,7 +693,7 @@ def _open_thread(context, page: Any, handle: str, timeout_ms: int) -> Any:
             clicked = False
         if clicked:
             break
-        page.wait_for_timeout(700)
+        _human_wait(page, 600, 1100)
     if not clicked and not page.evaluate("() => document.querySelectorAll('[data-testid=conversation]').length"):
         raise RuntimeError(
             "NO DM INBOX - the agent Chrome is on X but the Messages inbox did not "
@@ -657,7 +714,7 @@ def _open_thread(context, page: Any, handle: str, timeout_ms: int) -> Any:
             if ver.get("header"):
                 verified = True
                 break
-        thread.wait_for_timeout(500)
+        _human_wait(thread, 500, 950)
     if not verified:
         raise RuntimeError(
             f"COULD NOT VERIFY - X did not confirm the open DM thread belongs to "
@@ -698,7 +755,7 @@ def fetch_dm_thread(handle: str, display_name: str | None = None,
                     got = [{"sender": m.get("sender", "them"), "text": str(m.get("text", "")).strip()}
                            for m in raw if m.get("text")]
                     break
-                thread.wait_for_timeout(800)
+                _human_wait(thread, 600, 1100)
             _dbg(f"fetch_dm_thread @{handle} messages={len(got)}")
             return got
         finally:
@@ -781,15 +838,15 @@ def send_message(handle: str, text: str, timeout_ms: int = 40000,
                     focused = False
                 if focused:
                     break
-                thread.wait_for_timeout(500)
+                _human_wait(thread, 450, 900)
             if not focused:
                 raise RuntimeError(
                     f"Could not find the DM composer for @{handle}. X may require "
                     "them to have DMs open, or the page changed layout."
                 )
-            thread.wait_for_timeout(300)
-            thread.keyboard.type(text, delay=8)
-            thread.wait_for_timeout(400)
+            _human_wait(thread, 400, 900)
+            _type_human(thread, text)
+            _human_wait(thread, 400, 1000)
             echoed = ""
             for _ in range(4):
                 try:
@@ -798,7 +855,7 @@ def send_message(handle: str, text: str, timeout_ms: int = 40000,
                     echoed = ""
                 if echoed:
                     break
-                thread.wait_for_timeout(500)
+                _human_wait(thread, 450, 900)
             _dbg(f"send_message @{handle} typed_len={len(echoed)} (send left to human)")
             return echoed
         finally:
