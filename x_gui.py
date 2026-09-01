@@ -708,7 +708,7 @@ class XAgentApp(tk.Tk):
                 core.mark_swept(uid, sweep_id, "blocked")
 
             if i < n - 1:
-                delay = random.uniform(20, 45)
+                delay = random.uniform(25, 60)
                 _dbg(f"sweep: sleeping {delay:.0f}s before next user")
                 self.after(0, lambda d=delay: self._sweep_status(f"Sweep: pausing {d:.0f}s…"))
                 time.sleep(delay)

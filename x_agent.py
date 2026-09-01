@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any
@@ -642,9 +644,11 @@ def read_signals_live(username: str, user_id: int | None = None, session=None) -
     uid = upsert_user(data)
     _, grams = _store_user_extra(uid, data)
     _dbg(f"read_signals_live user stored uid={uid}")
+    time.sleep(random.uniform(1.5, 4.0))  # a person digests a profile before moving on
     posts = fetch_user_posts_page(username, count=25, session=session)
     new_posts = store_posts(uid, posts)
     _dbg(f"read_signals_live DONE uid={uid} new_posts={new_posts}")
+    time.sleep(random.uniform(0.8, 2.5))  # skim notes, then proceed to the next step
     set_user_status(uid, "qualified")
     return {"user": data, "new_posts": new_posts, "uid": uid, "metrics": grams}
 

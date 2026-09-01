@@ -387,7 +387,12 @@ def _profile_fetch(page: Any, handle: str, timeout_ms: int) -> dict[str, Any]:
         page.wait_for_selector('[data-testid="UserName"]', timeout=10000)
     except PlaywrightError:
         pass
-    _human_wait(page, 500, 1500)
+    _human_wait(page, 900, 2400)          # 'read' the profile header like a person
+    try:
+        page.evaluate(_SCROLL_JITTER_JS)  # occasional skim nudge while looking
+    except Exception:
+        pass
+    _human_wait(page, 500, 1400)
     out = page.evaluate(_PROFILE_NAME_JS) or {}
     # Fallback: name from the page title ("@handle (Display Name) / X").
     if not out.get("name"):
@@ -405,6 +410,7 @@ def _profile_fetch(page: Any, handle: str, timeout_ms: int) -> dict[str, Any]:
         )
     _dbg(f"_profile_fetch @{handle} name={out.get('name')!r} bio_len={len(out.get('bio') or '')} "
          f"followers={out.get('followers')}")
+    _human_wait(page, 700, 1700)          # linger before moving on to the next tab
     return {
         "username": (out.get("handle") or handle).lstrip("@").lower(),
         "display_name": out.get("name") or handle,
@@ -526,6 +532,7 @@ def fetch_user_posts_page(handle: str, count: int = 25, scroll_rounds: int = 2,
                 page.wait_for_selector('[data-testid="tweet"], [data-testid="tweetText"]', timeout=10000)
             except PlaywrightError:
                 pass
+            _human_wait(page, 1100, 2500)  # start reading the visible posts before scrolling
             collected: list[dict[str, Any]] = []
             seen: set[str] = set()
             for _r in range(scroll_rounds):
@@ -533,7 +540,7 @@ def fetch_user_posts_page(handle: str, count: int = 25, scroll_rounds: int = 2,
                     page.evaluate(_SCROLL_TIMELINE_JS)
                 except Exception:
                     pass
-                _human_wait(page, 900, 2200)   # 'absorb' the new posts
+                _human_wait(page, 1500, 3200)  # 'absorb' the newly scrolled posts
                 _jitter_scroll(page)
                 rows = page.evaluate(_TWEET_EXTRACT_JS) or []
                 for r in rows:
@@ -545,6 +552,7 @@ def fetch_user_posts_page(handle: str, count: int = 25, scroll_rounds: int = 2,
                 if len(collected) >= count:
                     break
             _dbg(f"fetch_user_posts_page @{handle} n={len(collected)}")
+            _human_wait(page, 800, 1800)  # linger over the last posts before leaving
             return collected[:count]
         finally:
             try:
@@ -615,6 +623,7 @@ def search_recent_users(query: str, count: int = 40, scroll_rounds: int = 3,
                 page.wait_for_selector('[data-testid="tweet"]', timeout=12000)
             except PlaywrightError:
                 pass
+            _human_wait(page, 1300, 2800)  # scan the first results before scrolling
             users: list[dict[str, Any]] = []
             seen: set[str] = set()
             for _r in range(scroll_rounds):
@@ -622,7 +631,7 @@ def search_recent_users(query: str, count: int = 40, scroll_rounds: int = 3,
                     page.evaluate(_SCROLL_TIMELINE_JS)
                 except Exception:
                     pass
-                _human_wait(page, 1000, 2400)
+                _human_wait(page, 1400, 3000)
                 _jitter_scroll(page)
                 for u in page.evaluate(_SEARCH_AUTHORS_JS) or []:
                     h = (u.get("username") or "").lower()
@@ -632,6 +641,7 @@ def search_recent_users(query: str, count: int = 40, scroll_rounds: int = 3,
                 if len(users) >= count:
                     break
             _dbg(f"search_recent_users query={query!r} unique={len(users)}")
+            _human_wait(page, 700, 1500)  # linger before leaving the search
             return users[:count]
         finally:
             try:
@@ -700,6 +710,7 @@ def _open_thread(context, page: Any, handle: str, timeout_ms: int) -> Any:
         page.wait_for_selector('[data-testid="conversation"]', timeout=12000)
     except PlaywrightError:
         pass
+    _human_wait(page, 1000, 2400)  # scan the conversation list before clicking one
 
     state_checked = False
     for _ in range(6):
@@ -847,6 +858,7 @@ def send_message(handle: str, text: str, timeout_ms: int = 40000,
         page = context.new_page()
         try:
             thread = _open_thread(context, page, str(handle).strip().lstrip("@"), timeout_ms)
+            _human_wait(thread, 1400, 3400)  # read the last messages before replying
             focused = False
             for _ in range(6):
                 try:
@@ -863,7 +875,7 @@ def send_message(handle: str, text: str, timeout_ms: int = 40000,
                 )
             _human_wait(thread, 400, 900)
             _type_human(thread, text)
-            _human_wait(thread, 400, 1000)
+            _human_wait(thread, 700, 1600)  # pause, then re-check what was typed
             echoed = ""
             for _ in range(4):
                 try:
@@ -873,6 +885,7 @@ def send_message(handle: str, text: str, timeout_ms: int = 40000,
                 if echoed:
                     break
                 _human_wait(thread, 450, 900)
+            _human_wait(thread, 600, 1300)  # look it over before the human sends
             _dbg(f"send_message @{handle} typed_len={len(echoed)} (send left to human)")
             return echoed
         finally:
