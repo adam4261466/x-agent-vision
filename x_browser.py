@@ -3,9 +3,9 @@
 The browser-based counterpart of the LinkedIn agent's linkedin_browser.py.
 Connects to an agent Chrome instance launched with --remote-debugging-port
 (its own profile, so it never collides with your LinkedIn agent browser), reads
-profiles and DM threads straight from the live X web DOM, and type drafts into
-the DM composer. It never presses the final Send button: the human reviews the
-typed message in X and clicks Send there.
+profiles and DM threads straight from the live X web DOM, and types drafts into
+the DM composer. Auto-send (send_dm) also clicks the Send button and handles
+the PIN-code verification X sometimes demands, mirroring the LinkedIn agent.
 
 Design rules mirrored from the LinkedIn agent:
 - One reusable BrowserSession per sweep, human-paced reads, no bulk actions.
@@ -17,7 +17,8 @@ Design rules mirrored from the LinkedIn agent:
 The X CDP endpoint defaults to http://127.0.0.1:9223 and can be overridden
 with X_CDP_URL. Automating x.com is against X's rules: this layer only reads
 public data the agent's own logged-in browser can already see, types drafts the
-human approves into the composer, and never hits send.
+human approves into the composer, and hits send only when the operator uses the
+auto-send button on a draft they have reviewed.
 """
 from __future__ import annotations
 
@@ -961,6 +962,220 @@ def send_message(handle: str, text: str, timeout_ms: int = 40000,
             _human_wait(thread, 600, 1300)  # look it over before the human sends
             _dbg(f"send_message @{handle} typed_len={len(echoed)} (send left to human)")
             return echoed
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+            _close_stray_pages(context, before)
+            if teardown:
+                browser.close()
+                pw.stop()
+
+
+# ---------------------------------------------------------------------------
+# Send a DM automatically (mirrors the LinkedIn agent): open the composer via
+# the profile 'Message' button, type, click Send, and satisfy the PIN-code
+# verification X sometimes asks for before the message goes out.
+# ---------------------------------------------------------------------------
+
+_HAS_COMPOSER_JS = """() => {
+    const sels = [
+        '[data-testid="dmComposerTextInput"]',
+        'div[data-testid="dmComposerTextInput"]',
+        'div[contenteditable="true"][role="textbox"]'
+    ];
+    for (const s of sels) {
+        if (document.querySelector(s)) return true;
+    }
+    return false;
+}"""
+
+_OPEN_PROFILE_MESSAGE_JS = """() => {
+    const nodes = Array.from(document.querySelectorAll('a,button'));
+    for (const n of nodes) {
+        if (n.offsetParent === null) continue;
+        const href = (n.getAttribute('href') || '').trim();
+        if (/^\\/messages\\/(compose|new)/.test(href) || href.indexOf('/messages/compose') !== -1) {
+            n.click(); return {clicked: true, url: href};
+        }
+        const aria = (n.getAttribute('aria-label') || '').toLowerCase().replace(/\\s+/g, '');
+        const txt = (n.innerText || '').toLowerCase().replace(/\\s+/g, '');
+        if (aria === 'message' || aria === 'senddm' || aria === 'sendmessage' || txt === 'message') {
+            n.click(); return {clicked: true, url: href};
+        }
+    }
+    return {clicked: false, url: ''};
+}"""
+
+_SEND_CLICK_JS = """() => {
+    const btn = document.querySelector('[data-testid="dmComposerSendButton"]');
+    if (btn) { btn.click(); return true; }
+    return false;
+}"""
+
+_VERIFY_DIALOG_JS = """() => {
+    const dialog = document.querySelector('[role="dialog"]');
+    if (!dialog) return {present: false, blocked: false, text: ''};
+    const t = (dialog.innerText || '').slice(0, 600);
+    const inputs = Array.from(dialog.querySelectorAll('input, textarea'))
+        .filter(el => el.offsetParent !== null);
+    if (inputs.length && /code|verif|pin|confirmation/i.test(t)) {
+        return {present: true, inputs: inputs.length, text: t};
+    }
+    if (/(can'?t send|cannot send|no longer send|not allowed|must be verified|to send this message|push notifications are off)/i.test(t)) {
+        return {present: false, blocked: true, text: t};
+    }
+    return {present: false, blocked: false, text: t};
+}"""
+
+_FILL_CODE_JS = """(code) => {
+    const dialog = document.querySelector('[role="dialog"]');
+    if (!dialog) return {filled: false};
+    const inputs = Array.from(dialog.querySelectorAll('input, textarea'))
+        .filter(el => el.offsetParent !== null);
+    if (!inputs.length) return {filled: false};
+    const input = inputs[0];
+    const proto = input.tagName === 'TEXTAREA'
+        ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    if (setter) setter.call(input, String(code || ''));
+    input.dispatchEvent(new Event('input', {bubbles: true}));
+    input.dispatchEvent(new Event('change', {bubbles: true}));
+    input.focus();
+    const btns = Array.from(dialog.querySelectorAll('button')).filter(b => b.offsetParent !== null);
+    return {filled: true, buttons: btns.length};
+}"""
+
+_DIALOG_PRIMARY_JS = """() => {
+    const dialog = document.querySelector('[role="dialog"]');
+    if (!dialog) return false;
+    const btns = Array.from(dialog.querySelectorAll('button')).filter(b => b.offsetParent !== null);
+    if (!btns.length) return false;
+    btns[btns.length - 1].click();
+    return true;
+}"""
+
+
+def _has_composer(page: Any) -> bool:
+    try:
+        return bool(page.evaluate(_HAS_COMPOSER_JS))
+    except PlaywrightError:
+        return False
+
+
+def _open_dm_composer(context, page: Any, handle: str, timeout_ms: int) -> Any:
+    """Open a DM composer with @handle. Preferred route: the profile's
+    'Message' button (works even with no existing conversation). Falls back to
+    the inbox thread search."""
+    handle = str(handle).strip().lstrip("@").lower()
+    _goto(page, f"https://x.com/{handle}", wait_selector="main", timeout_ms=timeout_ms)
+    _human_wait(page, 1000, 2400)
+    try:
+        out = page.evaluate(_OPEN_PROFILE_MESSAGE_JS) or {}
+    except PlaywrightError:
+        out = {}
+    if out.get("clicked"):
+        _dbg(f"_open_dm_composer @{handle} profile 'Message' clicked")
+        for _ in range(12):
+            _human_wait(page, 700, 1200)
+            if _has_composer(page):
+                _human_wait(page, 900, 1800)
+                return page
+    try:
+        return _open_thread(context, page, handle, timeout_ms)
+    except NoThreadError:
+        pass
+    raise RuntimeError(
+        f"Could not open a DM composer for @{handle}: no 'Message' button on "
+        "their profile and no existing conversation. They likely have DMs "
+        "closed, or X restricts messaging this account."
+    )
+
+
+def send_dm(handle: str, text: str, verification_code: str = "1234",
+            timeout_ms: int = 60000,
+            session: BrowserSession | None = None) -> str:
+    """Type the draft into the DM composer with @handle and CLICK Send (the
+    LinkedIn-style auto-send). If X asks for a PIN/verification code before the
+    message goes out (common on some accounts), fills `verification_code`
+    automatically (default 1234 - set it in Settings -> DM verification code).
+
+    Returns 'SENT' once the composer has emptied. If X instead shows a
+    'cannot message this account' dialog (e.g. the sending profile is not
+    verified), a clear error is raised and nothing is recorded."""
+    _dbg(f"send_dm START handle={handle!r} text_len={len(text)} code={'set' if verification_code else 'none'}")
+    if not text or not text.strip():
+        raise ValueError("Message text must not be empty")
+    text = text.strip()
+    with _BROWSER_LOCK:
+        pw = browser = context = None
+        teardown = session is None
+        if session is not None:
+            context = session.context
+        else:
+            pw, browser, context = _connect_sync()
+        before = {id(p) for p in context.pages}
+        page = context.new_page()
+        try:
+            thread = _open_dm_composer(context, page, str(handle).strip().lstrip("@"), timeout_ms)
+            _human_wait(thread, 1200, 2800)
+            focused = False
+            for _ in range(6):
+                try:
+                    focused = bool(thread.evaluate(_FOCUS_COMPOSER_JS))
+                except PlaywrightError:
+                    focused = False
+                if focused:
+                    break
+                _human_wait(thread, 450, 900)
+            if not focused:
+                raise RuntimeError(
+                    f"Could not find the DM composer for @{handle} after opening "
+                    "their profile -> Message."
+                )
+            _type_human(thread, text)
+            _human_wait(thread, 600, 1400)
+
+            for attempt in range(10):
+                try:
+                    dialog = thread.evaluate(_VERIFY_DIALOG_JS) or {}
+                except PlaywrightError:
+                    dialog = {}
+                if dialog.get("blocked"):
+                    raise RuntimeError(
+                        f"X will not let a DM go to @{handle}: "
+                        f"{(dialog.get('text') or '').strip()[:180]}"
+                    )
+                if dialog.get("present"):
+                    _dbg(f"send_dm @{handle} code-verification dialog (attempt {attempt + 1})")
+                    thread.evaluate(_FILL_CODE_JS, verification_code or "1234")
+                    _human_wait(thread, 900, 1800)
+                    try:
+                        thread.evaluate(_DIALOG_PRIMARY_JS)
+                    except PlaywrightError:
+                        pass
+                    _human_wait(thread, 1200, 2400)
+                    continue
+                try:
+                    thread.evaluate(_SEND_CLICK_JS)
+                except PlaywrightError:
+                    pass
+                _human_wait(thread, 900, 1800)
+                try:
+                    echoed = str(thread.evaluate(_COMPOSER_TEXT_JS) or "").strip()
+                except PlaywrightError:
+                    echoed = text
+                if not echoed:
+                    _dbg(f"send_dm @{handle} composer emptied -> SENT")
+                    return "SENT"
+                _human_wait(thread, 800, 1600)
+            raise RuntimeError(
+                f"Could not confirm the DM to @{handle} went through: the "
+                "composer still has the text after trying to send. If X needs "
+                "account verification (unverified sending profile), do that in "
+                "the agent Chrome once, then retry."
+            )
         finally:
             try:
                 page.close()

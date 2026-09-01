@@ -20,7 +20,7 @@ from datetime import datetime
 from tkinter import messagebox, simpledialog, ttk
 
 import x_agent as core
-from x_browser import BrowserSession, search_recent_users, send_message
+from x_browser import BrowserSession, search_recent_users, send_dm, send_message
 
 _LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "x_gui_debug.log")
 
@@ -106,8 +106,10 @@ class _SweepRow:
 
         btnbar = ttk.Frame(frame)
         btnbar.grid(row=3, column=0, columnspan=3, sticky="ew")
+        self.auto_btn = ttk.Button(btnbar, text="Send now (auto)", command=self.send_now)
+        self.auto_btn.pack(side="left")
         self.send_btn = ttk.Button(btnbar, text="Type into composer", command=self.send)
-        self.send_btn.pack(side="left")
+        self.send_btn.pack(side="left", padx=6)
         self.reg_btn = ttk.Button(btnbar, text="↻ Regenerate", command=self.regenerate)
         self.reg_btn.pack(side="left", padx=6)
         self.skip_btn = ttk.Button(btnbar, text="Skip", command=self.skip)
@@ -119,7 +121,7 @@ class _SweepRow:
 
     def _set_running(self, running: bool) -> None:
         state = "disabled" if running else "normal"
-        for b in (self.send_btn, self.skip_btn, self.reg_btn, self.confirm_btn):
+        for b in (self.send_btn, self.skip_btn, self.reg_btn, self.confirm_btn, self.auto_btn):
             try:
                 b.configure(state=state)
             except Exception:
@@ -193,6 +195,39 @@ class _SweepRow:
                 self.app.after(0, lambda err=err: self._mark_fail(err))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def send_now(self) -> None:
+        if self.done:
+            return
+        text = self.msg.get("1.0", "end-1c").strip()
+        if not text:
+            self.status.configure(text="message is empty — edit it first", foreground="#e74c3c")
+            return
+        self.done = True
+        self._set_running(True)
+        self.status.configure(text="typing + sending in agent Chrome…", foreground="#f2994a")
+        username = self._username()
+        uid = self._user_id()
+
+        def worker() -> None:
+            try:
+                code = core.get_setting("dm_verification_code") or "1234"
+                result = send_dm(username, text, verification_code=code)
+                core.record_sent(uid, text)
+                core.add_event(uid, "DM_SENT", text[:200])
+                self.app.after(0, lambda result=result: self._mark_sent(result))
+            except Exception as exc:
+                err = str(exc)
+                _dbg(f"sweep send(auto) FAILED @{username}: {type(exc).__name__}: {exc}")
+                self.app.after(0, lambda err=err: self._mark_fail(err))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _mark_sent(self, result: str) -> None:
+        self._sent_recorded = True
+        self.done = True
+        self._set_running(False)
+        self.status.configure(text=f"✓ {result} and recorded", foreground="#27ae60")
 
     def confirm_sent(self) -> None:
         """Record the DM as sent after the human clicks Send in X."""
@@ -274,18 +309,23 @@ class XAgentApp(tk.Tk):
             row=6, column=0, sticky="ew", pady=(0, 10)
         )
 
+        ttk.Button(side, text="Settings…", command=self.ask_settings).grid(
+            row=7, column=0, sticky="ew", pady=(0, 10)
+        )
+
         ttk.Label(
             side,
             text=("Run sweep reads each user's profile + recent posts + DMs from "
                   "the agent Chrome, figures out who needs a message, and shows a "
                   "row per person.\n\n"
-                  "Type into composer = opens the DM in the agent Chrome and "
-                  "types the approved draft into the message box. YOU press the "
-                  "final Send in X, then click 'Confirm sent' to record it.\n\n"
-                  "Users without an explicit intent signal (mention, request, "
-                  "follow-back) are WATCHED, never messaged — X forbids "
-                  "unsolicited DMs. First DMs are only drafted for users who "
-                  "engaged with you first."),
+                  "Send now (auto) = opens their profile in the agent Chrome, "
+                  "clicks 'Message', types the draft, clicks Send, enters the PIN "
+                  "code if X asks, and records it as sent (like the LinkedIn "
+                  "agent). Type into composer = only types; you press Send and "
+                  "'Confirm sent'.\n\n"
+                  "People without an intent signal get cold-intro drafts up to the "
+                  "per-pass cap (Settings…); the rest are watched and skipped. X "
+                  "punishes volume - keep the cap sensible."),
             justify="left",
             wraplength=220,
             foreground="#555",
@@ -364,7 +404,9 @@ class XAgentApp(tk.Tk):
         self.editor.grid(row=0, column=0, sticky="ew")
         bar = ttk.Frame(composer)
         bar.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(bar, text="Save as sent", command=lambda: self.save_message("outbound")).pack(side="left")
+        self.sendnow_btn = ttk.Button(bar, text="Send now (auto)", command=self.send_selected)
+        self.sendnow_btn.pack(side="left")
+        ttk.Button(bar, text="Save as sent", command=lambda: self.save_message("outbound")).pack(side="left", padx=8)
         ttk.Button(bar, text="Save their reply", command=lambda: self.save_message("inbound")).pack(side="left", padx=8)
         ttk.Button(bar, text="Clear", command=self.clear_editor).pack(side="left")
         self.status_var = tk.StringVar(value="Ready")
@@ -431,7 +473,7 @@ class XAgentApp(tk.Tk):
         self.clear_editor()
 
     def _update_buttons(self, row) -> None:
-        for button in (self.open_btn, self.signals_btn, self.dms_btn):
+        for button in (self.open_btn, self.signals_btn, self.dms_btn, self.sendnow_btn):
             button.configure(state="normal")
         has_inbound = any(m["direction"] == "inbound" for m in core.get_messages(self.selected_id)) if self.selected_id else False
         self.reply_btn.configure(state="normal" if has_inbound else "disabled")
@@ -442,7 +484,8 @@ class XAgentApp(tk.Tk):
         self.info_var.set("Select someone from the list")
         self.action_var.set("")
         self.posts_var.set("")
-        for button in (self.open_btn, self.signals_btn, self.dms_btn, self.initial_btn, self.reply_btn):
+        for button in (self.open_btn, self.signals_btn, self.dms_btn, self.initial_btn,
+                       self.reply_btn, self.sendnow_btn):
             button.configure(state="disabled")
         self.history.configure(state="normal")
         self.history.delete("1.0", "end")
@@ -637,6 +680,10 @@ class XAgentApp(tk.Tk):
             self.sweep_btn.configure(state="disabled" if busy else "normal")
         except Exception:
             pass
+        try:
+            self.sendnow_btn.configure(state="disabled" if busy else "normal")
+        except Exception:
+            pass
 
     # --- settings ---------------------------------------------------------------
     def ask_set_link(self) -> None:
@@ -648,6 +695,68 @@ class XAgentApp(tk.Tk):
             self.status_var.set("App link saved.")
         else:
             self.status_var.set("App link unchanged.")
+
+    def ask_settings(self) -> None:
+        raw = simpledialog.askstring(
+            "Settings - cold drafts per pass",
+            "How many cold (no-signal) first-message drafts should one sweep "
+            "pass produce? (1-50)\n\nOnly these get drafted; everyone else in the "
+            "pass is left watching and skipped.", initialvalue=str(core.max_cold_drafts()),
+            parent=self)
+        if raw is None:
+            return
+        try:
+            n = max(1, min(50, int(raw)))
+        except ValueError:
+            messagebox.showerror("Settings", "Enter a whole number between 1 and 50.")
+            return
+        core.set_setting("max_cold_drafts", str(n))
+        code = simpledialog.askstring(
+            "Settings - DM verification code",
+            "PIN X asks for before a DM to some accounts goes out:",
+            initialvalue=core.get_setting("dm_verification_code") or "1234", parent=self)
+        if code is not None:
+            core.set_setting("dm_verification_code", (code.strip() or "1234"))
+        self.status_var.set(
+            f"Settings saved: {n} cold draft(s) per pass, DM code "
+            f"{core.get_setting('dm_verification_code') or '1234'}.")
+
+    def send_selected(self) -> None:
+        try:
+            uid = self._require()
+            text = self.editor.get("1.0", "end-1c").strip()
+            if not text:
+                raise ValueError("Message is empty - write something first.")
+            row = core.get_user(uid)
+            if row is None:
+                raise ValueError("User not found.")
+        except Exception as exc:
+            messagebox.showerror("Send now", str(exc))
+            return
+        username = str(row["username"]).lstrip("@")
+        self._set_busy(True, f"DM to @{username}: typing + sending…")
+
+        def worker() -> None:
+            try:
+                code = core.get_setting("dm_verification_code") or "1234"
+                result = send_dm(username, text, verification_code=code)
+                core.record_sent(uid, text)
+                core.add_event(uid, "DM_SENT", text[:200])
+                self.after(0, lambda result=result, u=username: self._send_done(u, result))
+            except Exception as exc:
+                err = str(exc)
+                _dbg(f"send_selected FAILED @{username}: {type(exc).__name__}: {exc}")
+                self.after(0, lambda err=err: self._send_error(err))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _send_done(self, username: str, result: str) -> None:
+        self._set_busy(False, f"DM sent to @{username} ({result}) and recorded.")
+        self.refresh_selection()
+
+    def _send_error(self, err: str) -> None:
+        self._set_busy(False, "Send failed.")
+        messagebox.showerror("Send now", err)
 
     # --- sweep ------------------------------------------------------------------
     def run_sweep(self) -> None:
@@ -763,7 +872,7 @@ class XAgentApp(tk.Tk):
         picked: list = []
         for stage in ("qualified", "discovered"):
             for r in groups.get(stage, []):
-                if len(picked) >= core.MAX_COLD_DRAFTS_PER_PASS:
+                if len(picked) >= core.max_cold_drafts():
                     return picked
                 if core.get_recent_posts(int(r["id"]), max_posts=1):
                     picked.append(r)
@@ -798,15 +907,19 @@ class XAgentApp(tk.Tk):
             parts.append(f"{waiting['goal']} goal done (skipped)")
         watched = waiting["qualified"] + waiting["discovered"] - cold_count
         if watched > 0:
-            parts.append(f"{watched} watching - no intent signal (skipped)")
+            cap = core.max_cold_drafts()
+            tip = (" (cap reached - raise 'cold drafts per pass' in Settings "
+                   "to include more)") if cold_count >= cap else " (skipped)"
+            parts.append(f"{watched} watching - no intent signal{tip}")
         summary = ", ".join(parts) if parts else "Nothing actionable right now."
         ttk.Label(win, text=summary, font=("Segoe UI", 11, "bold"), anchor="w").pack(
             anchor="w", padx=12, pady=(10, 2))
 
-        ttk.Label(win, text=("Each person below has a draft you can edit. 'Type into composer' opens their DM "
-                             "in the agent Chrome and types the draft into the message box - you press the final "
-                             "Send in X, then click 'Confirm sent' to record it. Skip = leave them for later. "
-                             "Cold intros are unsolicited first messages, so read each one carefully before sending."),
+        ttk.Label(win, text=("Each person below has a draft you can edit. 'Send now (auto)' types it into the "
+                             "composer in the agent Chrome, clicks Send (entering the PIN code if X asks), and "
+                             "records it as sent. 'Type into composer' only types - you press Send and 'Confirm "
+                             "sent'. Skip = leave them for later. Cold intros are unsolicited first messages, so "
+                             "read each one carefully before sending."),
                   font=("Segoe UI", 9)).pack(anchor="w", padx=12, pady=(2, 4))
 
         canvas = tk.Canvas(win)

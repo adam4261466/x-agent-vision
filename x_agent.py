@@ -38,10 +38,12 @@ INTENT_SIGNALS = {
     "FOLLOW_BACK", "POST_REPLY_INBOUND", "QUOTE_INBOUND",
 }
 
-# Cap on cold (unsolicited) first-message drafts generated per sweep pass.
-# The human still edits and presses the final Send for each one; this cap just
-# stops a sweep pass from ever turning into a blast.
-MAX_COLD_DRAFTS_PER_PASS = 5
+# Default cap on cold (unsolicited) first-message drafts generated per sweep
+# pass (15 of a typical 20-user pass). The human still edits and presses the
+# final Send for each one; the cap just stops a sweep pass from ever turning
+# into a blast. Can be raised in the GUI (Settings -> cold drafts per pass) and
+# is persisted to the settings table.
+MAX_COLD_DRAFTS_PER_PASS = 15
 
 
 def _dbg(msg: str):
@@ -531,6 +533,14 @@ def product_name() -> str:
     return get_setting("product_name") or "Doxium"
 
 
+def max_cold_drafts() -> int:
+    """Cold first-message drafts allowed per sweep pass (Settings override)."""
+    try:
+        return max(1, int(get_setting("max_cold_drafts") or MAX_COLD_DRAFTS_PER_PASS))
+    except (TypeError, ValueError):
+        return MAX_COLD_DRAFTS_PER_PASS
+
+
 def open_profile(username: str) -> None:
     if os.name == "nt":
         subprocess.Popen(["cmd", "/c", "start", "", f"https://x.com/{username.lstrip('@')}"], shell=False)
@@ -603,35 +613,47 @@ def _generate_first_dm(user_id: int, cold: bool) -> str:
     facts = format_recent_posts(user_id, max_posts=6)
     if cold:
         permission = ("This is COLD outreach: they have NOT signaled any interest. "
-                      "Open only with a concrete reference to ONE of their RECENT "
-                      "POSTS (an actual topic they post about - never praise, never "
-                      "'I saw your post', never pretend they know you). It is "
-                      "unsolicited, so stay under 2 short sentences, be genuinely "
-                      "specific, and end with one light question. You MUST NOT remark "
-                      "that they gave a signal, because they did not.")
+                      "Only open with a concrete reference to ONE of their RECENT "
+                      "POSTS (the actual subject they post about - never generic "
+                      "praise, never 'I saw your post', never pretend they know "
+                      "you). Keep it under 2 short sentences, be genuinely "
+                      "specific, and end with one light question.")
     else:
-        permission = ("They gave some signal of interest (mention, request, follow-back, "
-                      "or they followed Doxium) - so a first DM is allowed. Keep it useful "
-                      "and low-pressure.")
+        permission = ("They gave some signal of interest (mention, request, "
+                      "follow-back, or they followed you) - a first DM is OK here, "
+                      "just don't sound salesy.")
     prompt = (
-        "Write an X DM first message to this person. RULES - follow exactly:\n"
-        "- MAX 2 short sentences. Casual, like one person DMs another who is clearly talking about a topic you know.\n"
-        "- Sentence 1: reference ONE specific post/topic from their RECENT POSTS below (exact topic, not praise). "
-        "Never open with a compliment or 'I saw your post'.\n"
-        "- Sentence 2: one natural line connecting their topic to what you build, then a light question.\n"
-        "- Do NOT mention a link. No pricing, no jargon, no exclamation marks, never invent facts about them.\n"
-        f"- {permission}\n\n"
+        "Write a short, NATURAL DM to this person on X. It must read like a real "
+        "person who saw their post a minute ago and quickly typed something - "
+        "NOT marketing, NOT a sales pitch, NOT a bot.\n"
+        "RULES - follow exactly:\n"
+        "- 1-2 short sentences max. Use contractions (you're, that's, I'd).\n"
+        "- Sentence 1: name ONE concrete subject from their RECENT POSTS below "
+        "(the actual case, app, tool, city, project, event they talked about). "
+        "Never generic praise and never 'caught my eye' / 'I noticed' / 'I saw "
+        "your post'.\n"
+        "- Sentence 2: tied to that subject, ask one real, specific question "
+        "about their work or perspective. No calls, no pricing, no link.\n"
+        "- NEVER use: 'caught my eye', 'I'm building a tool', 'wanted to reach "
+        "out', 'resonated', 'just wanted to', exclamation marks, jargon, or "
+        "anything that sounds like a template.\n"
+        "- If you mention what someone does, make it one conversational clause - "
+        "e.g. 'we work on [domain] too' - never 'I'm building a tool for X'.\n"
+        f"- {permission}\n"
+        f"Your product/domain (mention naturally if it fits, else skip): {product_name()}\n\n"
         f"PERSON\n{_user_context(p)}\n\nRECENT POSTS\n{facts}\n\nCONVERSATION\n{format_history(user_id)}"
     )
     _dbg(f"generate_{'cold_initial' if cold else 'initial'} prompt len={len(prompt)}")
     draft = _ollama_chat(
         [{"role": "system", "content": (
-            "You write extremely short, casual X DMs (1-2 sentences). You open with a concrete reference to "
-            "something the person actually posted recently, never praise. You tie their topic to what the human "
-            "operator builds in one natural line, ask a light question, and never drop links or pricing. "
-            "Tone: one thoughtful person DMs another about a shared interest.")},
+            "You write X DMs the way a real, friendly person actually texts: 1-2 "
+            "short sentences, contractions, one specific reference to what the "
+            "person really posted, and a genuine question. You never open with "
+            "praise or 'saw your post', never use template phrases like 'caught "
+            "my eye' or 'I'm building a tool', never drop links or pricing, and "
+            "you never sound like marketing.")},
          {"role": "user", "content": prompt}],
-        temperature=0.85,
+        temperature=0.9,
     )
     save_draft(user_id, "cold" if cold else "initial", draft)
     return draft
