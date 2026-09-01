@@ -38,6 +38,11 @@ INTENT_SIGNALS = {
     "FOLLOW_BACK", "POST_REPLY_INBOUND", "QUOTE_INBOUND",
 }
 
+# Cap on cold (unsolicited) first-message drafts generated per sweep pass.
+# The human still edits and presses the final Send for each one; this cap just
+# stops a sweep pass from ever turning into a blast.
+MAX_COLD_DRAFTS_PER_PASS = 5
+
 
 def _dbg(msg: str):
     try:
@@ -121,7 +126,7 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS drafts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
-            kind TEXT NOT NULL CHECK(kind IN ('initial','reply')),
+            kind TEXT NOT NULL CHECK(kind IN ('initial','reply','cold')),
             content TEXT NOT NULL,
             created_at TEXT NOT NULL,
             FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -151,7 +156,28 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id,created_at);
         CREATE INDEX IF NOT EXISTS idx_sweep_state ON sweep_state(sweep_id,user_id);
         """)
+        _ensure_drafts_kind(db)
         _dbg("init_db done")
+
+
+def _ensure_drafts_kind(db) -> None:
+    """SQLite cannot alter a CHECK constraint in place, so if a legacy drafts
+    table only allows ('initial','reply') we rebuild it to also allow 'cold'."""
+    row = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='drafts'").fetchone()
+    if row and row["sql"] and "'cold'" not in row["sql"]:
+        _dbg("migrating drafts.kind CHECK to allow 'cold'")
+        db.execute("""CREATE TABLE drafts_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('initial','reply','cold')),
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        )""")
+        db.execute("""INSERT INTO drafts_new (id, user_id, kind, content, created_at)
+            SELECT id, user_id, kind, content, created_at FROM drafts""")
+        db.execute("DROP TABLE drafts")
+        db.execute("ALTER TABLE drafts_new RENAME TO drafts")
 
 
 def reset_db() -> None:
@@ -437,6 +463,11 @@ def _has_user_intent(user_id: int) -> bool:
         return row2 is not None
 
 
+def has_user_intent(user_id: int) -> bool:
+    """Public wrapper - exposes whether a first DM may cite an explicit signal."""
+    return _has_user_intent(user_id)
+
+
 def classify_prospect(row) -> tuple[str, str]:
     """Return (stage, action_text) for one user row based on recorded DMs/events.
 
@@ -550,13 +581,38 @@ def format_history(user_id: int, max_messages: int = 30) -> str:
 
 
 def generate_initial(user_id: int) -> str:
-    _dbg(f"generate_initial START user_id={user_id}")
+    return _generate_first_dm(user_id, cold=False)
+
+
+def generate_cold_initial(user_id: int) -> str:
+    """Draft a first DM for a prospect with NO intent signal (cold outreach).
+
+    Unsolicited, so the prompt must never pretend they showed interest, and it
+    is saved under its own draft kind ('cold') to keep it distinct from
+    intent-based first messages."""
+    return _generate_first_dm(user_id, cold=True)
+
+
+def _generate_first_dm(user_id: int, cold: bool) -> str:
+    _dbg(f"generate_{'cold_initial' if cold else 'initial'} START user_id={user_id}")
     p = get_user(user_id)
     if not p:
         raise ValueError("User not found")
     if not app_url():
-        _dbg("generate_initial: no app link set, drafting intro without link")
+        _dbg("_generate_first_dm: no app link set, drafting intro without link")
     facts = format_recent_posts(user_id, max_posts=6)
+    if cold:
+        permission = ("This is COLD outreach: they have NOT signaled any interest. "
+                      "Open only with a concrete reference to ONE of their RECENT "
+                      "POSTS (an actual topic they post about - never praise, never "
+                      "'I saw your post', never pretend they know you). It is "
+                      "unsolicited, so stay under 2 short sentences, be genuinely "
+                      "specific, and end with one light question. You MUST NOT remark "
+                      "that they gave a signal, because they did not.")
+    else:
+        permission = ("They gave some signal of interest (mention, request, follow-back, "
+                      "or they followed Doxium) - so a first DM is allowed. Keep it useful "
+                      "and low-pressure.")
     prompt = (
         "Write an X DM first message to this person. RULES - follow exactly:\n"
         "- MAX 2 short sentences. Casual, like one person DMs another who is clearly talking about a topic you know.\n"
@@ -564,11 +620,10 @@ def generate_initial(user_id: int) -> str:
         "Never open with a compliment or 'I saw your post'.\n"
         "- Sentence 2: one natural line connecting their topic to what you build, then a light question.\n"
         "- Do NOT mention a link. No pricing, no jargon, no exclamation marks, never invent facts about them.\n"
-        "- They gave some signal of interest (mention, request, follow-back, or they followed Doxium) - so a first "
-        "DM is allowed. Keep it useful and low-pressure.\n\n"
+        f"- {permission}\n\n"
         f"PERSON\n{_user_context(p)}\n\nRECENT POSTS\n{facts}\n\nCONVERSATION\n{format_history(user_id)}"
     )
-    _dbg(f"generate_initial prompt len={len(prompt)}")
+    _dbg(f"generate_{'cold_initial' if cold else 'initial'} prompt len={len(prompt)}")
     draft = _ollama_chat(
         [{"role": "system", "content": (
             "You write extremely short, casual X DMs (1-2 sentences). You open with a concrete reference to "
@@ -578,7 +633,7 @@ def generate_initial(user_id: int) -> str:
          {"role": "user", "content": prompt}],
         temperature=0.85,
     )
-    save_draft(user_id, "initial", draft)
+    save_draft(user_id, "cold" if cold else "initial", draft)
     return draft
 
 

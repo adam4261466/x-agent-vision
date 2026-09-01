@@ -42,11 +42,13 @@ SWEEP_BADGE_TEXT = {
     "initial": "First DM",
     "reply": "Reply",
     "goal_reply": "Goal + reply",
+    "cold": "Cold intro",
 }
 SWEEP_BADGE_COLOR = {
     "initial": "#2d7ff9",
     "reply": "#f2994a",
     "goal_reply": "#9b51e0",
+    "cold": "#d35400",
 }
 
 _STAGE_LABEL = {
@@ -143,7 +145,8 @@ class _SweepRow:
 
         def worker() -> None:
             try:
-                text = core.generate_initial(uid) if stage == "initial" else core.generate_reply(uid)
+                gen = {"initial": core.generate_initial, "cold": core.generate_cold_initial}.get(stage, core.generate_reply)
+                text = gen(uid)
                 self.app.after(0, lambda text=text: self._mark_updated(text))
             except Exception as exc:
                 err = str(exc)
@@ -576,9 +579,9 @@ class XAgentApp(tk.Tk):
     def generate_initial(self) -> None:
         try:
             uid = self._require()
-            text = core.generate_initial(uid)
+            text = core.generate_initial(uid) if core.has_user_intent(uid) else core.generate_cold_initial(uid)
             self._fill_editor(text)
-            self._set_busy(False, "First DM draft generated — review and send only if intent is real.")
+            self._set_busy(False, "First DM draft generated — review before sending.")
         except Exception as exc:
             messagebox.showerror("Generate first DM", str(exc))
 
@@ -741,7 +744,30 @@ class XAgentApp(tk.Tk):
                     _dbg(f"sweep preview FAILED uid={uid}: {exc}")
                     text = f"[draft generation failed: {exc}]"
                 previews.append({"stage": stage, "user": r, "text": text})
+        for r in self._cold_prospects(groups):
+            uid = int(r["id"])
+            try:
+                text = core.generate_cold_initial(uid)
+            except Exception as exc:
+                _dbg(f"sweep cold preview FAILED uid={uid}: {exc}")
+                text = f"[cold draft generation failed: {exc}]"
+            previews.append({"stage": "cold", "user": r, "text": text})
         return previews
+
+    @staticmethod
+    def _cold_prospects(groups: dict[str, list]) -> list:
+        """Qualified/discovered prospects with something posted, capped per pass.
+
+        Cold (unsolicited) intros are edited and reviewed by the human before the
+        final Send - the cap keeps a sweep from ever becoming a blast."""
+        picked: list = []
+        for stage in ("qualified", "discovered"):
+            for r in groups.get(stage, []):
+                if len(picked) >= core.MAX_COLD_DRAFTS_PER_PASS:
+                    return picked
+                if core.get_recent_posts(int(r["id"]), max_posts=1):
+                    picked.append(r)
+        return picked
 
     def _sweep_show(self, groups: dict[str, list], previews: list[dict] | None = None) -> None:
         _dbg("_sweep_show opening review window")
@@ -756,6 +782,7 @@ class XAgentApp(tk.Tk):
 
         needs = {s: len(groups.get(s, [])) for s in ("initial", "reply", "goal_reply")}
         waiting = {s: len(groups.get(s, [])) for s in ("awaiting", "goal", "qualified", "discovered")}
+        cold_count = sum(1 for p in previews if p["stage"] == "cold")
         parts = []
         if needs["initial"]:
             parts.append(f"{needs['initial']} with intent need a first DM")
@@ -763,19 +790,23 @@ class XAgentApp(tk.Tk):
             parts.append(f"{needs['reply']} need a reply")
         if needs["goal_reply"]:
             parts.append(f"{needs['goal_reply']} goal reached + wrote back")
+        if cold_count:
+            parts.append(f"{cold_count} cold intro draft(s) to review (unsolicited - no signal yet)")
         if waiting["awaiting"]:
             parts.append(f"{waiting['awaiting']} waiting on their reply (skipped)")
         if waiting["goal"]:
             parts.append(f"{waiting['goal']} goal done (skipped)")
-        if waiting["qualified"] + waiting["discovered"]:
-            parts.append(f"{waiting['qualified'] + waiting['discovered']} watching — no intent signal yet (skipped)")
+        watched = waiting["qualified"] + waiting["discovered"] - cold_count
+        if watched > 0:
+            parts.append(f"{watched} watching - no intent signal (skipped)")
         summary = ", ".join(parts) if parts else "Nothing actionable right now."
         ttk.Label(win, text=summary, font=("Segoe UI", 11, "bold"), anchor="w").pack(
             anchor="w", padx=12, pady=(10, 2))
 
         ttk.Label(win, text=("Each person below has a draft you can edit. 'Type into composer' opens their DM "
                              "in the agent Chrome and types the draft into the message box - you press the final "
-                             "Send in X, then click 'Confirm sent' to record it. Skip = leave them for later."),
+                             "Send in X, then click 'Confirm sent' to record it. Skip = leave them for later. "
+                             "Cold intros are unsolicited first messages, so read each one carefully before sending."),
                   font=("Segoe UI", 9)).pack(anchor="w", padx=12, pady=(2, 4))
 
         canvas = tk.Canvas(win)
