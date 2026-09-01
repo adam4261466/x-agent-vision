@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ========================================
-echo   X Agent - Signal CRM (API-first)
+echo   X Agent - Signal CRM (browser-based)
 echo ========================================
 echo.
 
@@ -14,12 +14,20 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist "x_agent.db" (
-    echo First run: database will be created by the app.
-    echo Set your X credentials via 'Set X credentials' after it opens.
-    echo.
+python -c "import playwright" >nul 2>nul
+if errorlevel 1 (
+    echo Installing required Python packages: playwright, requests...
+    python -m pip install -r requirements.txt
+    if errorlevel 1 (
+        echo ERROR: Failed to install required packages.
+        pause
+        exit /b 1
+    )
 )
 
+echo.
+echo The agent Chrome (its own profile) opens automatically on
+echo port 9223. Log in to X in it once when it appears.
 echo.
 echo Starting X Agent...
 python x_gui.py

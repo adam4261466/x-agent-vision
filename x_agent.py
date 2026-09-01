@@ -4,10 +4,11 @@ This is the platform-independent brain of the agent. It owns the CRM (users,
 posts, events, DMs, drafts, settings, sweep sessions), the relationship state
 machine, and the Ollama message generator.
 
-The X platform adapter (x_api.py) is a separate layer, exactly like the
+The X platform adapter (x_browser.py) is a separate layer, exactly like the
 LinkedIn browser adapter is for the LinkedIn agent. The brain never talks to
-x.com directly - it tells the adapter what it needs and persists everything to
-SQLite, so an interrupted sweep or an API outage never loses the workflow.
+x.com directly - it tells the adapter what it needs (read a profile, read a DM
+thread, type into the composer) and persists everything to SQLite, so an
+interrupted sweep or an X outage never loses the workflow.
 """
 from __future__ import annotations
 
@@ -185,7 +186,7 @@ def add_user(username: str, source: str = "manual") -> int:
 
 
 def upsert_user(data: dict[str, Any]) -> int:
-    """Merge a normalized user dict from the X API into the CRM.
+    """Merge a normalized user dict from the browser adapter into the CRM.
 
     'username' is the unique key. Missing rows are inserted as discovered and
     prefilled from the API; existing rows get their public data refreshed.
@@ -630,17 +631,18 @@ def set_eliminated(user_id: int, eliminated: bool, reason: str | None = None) ->
 # ---------------------------------------------------------------------------
 
 def read_signals_live(username: str, user_id: int | None = None, session=None) -> dict:
-    """Fetch the user's profile + recent posts from the X API and persist them.
+    """Read the user's profile + recent posts from the live X page and persist
+    them.
 
     Returns {"user": {..normalized..}, "new_posts": int}.
     """
-    from x_api import fetch_user, fetch_user_posts
+    from x_browser import fetch_profile_page, fetch_user_posts_page
     _dbg(f"read_signals_live START username={username!r} user_id={user_id}")
-    data = fetch_user(username, session=session)
+    data = fetch_profile_page(username, session=session)
     uid = upsert_user(data)
     _, grams = _store_user_extra(uid, data)
     _dbg(f"read_signals_live user stored uid={uid}")
-    posts = fetch_user_posts(uid, data.get("user_id") or str(data.get("user_id")), count=25, session=session)
+    posts = fetch_user_posts_page(username, count=25, session=session)
     new_posts = store_posts(uid, posts)
     _dbg(f"read_signals_live DONE uid={uid} new_posts={new_posts}")
     set_user_status(uid, "qualified")
@@ -658,17 +660,18 @@ def _store_user_extra(uid: int, data: dict[str, Any]) -> tuple[int, dict]:
 
 
 def read_dms_live(user_id: int, username: str, session=None) -> dict:
-    """Fetch the DM conversation with this user from the X API and save messages.
+    """Read the DM thread with this user from the live X page and save messages.
 
-    The API reports event sender IDs; the adapter already resolves them to
-    'me'/'them' using the authenticated account id, so we trust it (same
-    attribute-verification philosophy as the LinkedIn DOM reader).
+    The browser layer attributes each message deterministically from the DOM
+    (their messages carry the participant avatar, ours align right), so the
+    brain trusts the adapter, same attribute-verification philosophy as the
+    LinkedIn DOM reader.
 
     Returns {"messages": [...], "new": n}.
     """
-    from x_api import fetch_dm_conversation
+    from x_browser import fetch_dm_thread
     _dbg(f"read_dms_live START user_id={user_id} username={username!r}")
-    rows = fetch_dm_conversation(username, session=session)
+    rows = fetch_dm_thread(username, display_name=None, session=session) or []
     new = 0
     for m in rows:
         direction = "inbound" if m.get("sender") == "them" else "outbound"

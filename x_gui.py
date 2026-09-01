@@ -5,8 +5,8 @@ panel (profile + posts + DMs), an editable proposal box, Send/Regenerate/Skip,
 and a sweep that produces one review row per actionable person.
 
 Design invariant (same as LinkedIn): LLM proposes -> human reviews -> action
-occurs -> result is persisted. Sends go through the official X API and only
-ever at human request.
+occurs -> result is persisted. DMs are typed into the composer of the agent
+Chrome and the human presses the final Send; the agent never sends on its own.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from datetime import datetime
 from tkinter import messagebox, simpledialog, ttk
 
 import x_agent as core
-from x_api import PlatformSession, search_users, send_dm
+from x_browser import BrowserSession, search_recent_users, send_message
 
 _LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "x_gui_debug.log")
 
@@ -70,6 +70,7 @@ class _SweepRow:
         self.stage = proposal["stage"]
         self.text = proposal["text"]
         self.done = False
+        self._sent_recorded = False
 
         frame = ttk.LabelFrame(parent, padding=8)
         frame.pack(fill="x", padx=6, pady=4)
@@ -103,18 +104,20 @@ class _SweepRow:
 
         btnbar = ttk.Frame(frame)
         btnbar.grid(row=3, column=0, columnspan=3, sticky="ew")
-        self.send_btn = ttk.Button(btnbar, text="Send DM", command=self.send)
+        self.send_btn = ttk.Button(btnbar, text="Type into composer", command=self.send)
         self.send_btn.pack(side="left")
         self.reg_btn = ttk.Button(btnbar, text="↻ Regenerate", command=self.regenerate)
         self.reg_btn.pack(side="left", padx=6)
         self.skip_btn = ttk.Button(btnbar, text="Skip", command=self.skip)
         self.skip_btn.pack(side="left", padx=6)
+        self.confirm_btn = ttk.Button(btnbar, text="✓ Confirm sent", command=self.confirm_sent)
+        self.confirm_btn.pack(side="left", padx=6)
         self.status = tk.Label(btnbar, text="generated", foreground="#888")
         self.status.pack(side="left", padx=10)
 
     def _set_running(self, running: bool) -> None:
         state = "disabled" if running else "normal"
-        for b in (self.send_btn, self.skip_btn, self.reg_btn):
+        for b in (self.send_btn, self.skip_btn, self.reg_btn, self.confirm_btn):
             try:
                 b.configure(state=state)
             except Exception:
@@ -173,22 +176,39 @@ class _SweepRow:
         self.text = text
         self.done = True
         self._set_running(True)
-        self.status.configure(text="sending…", foreground="#f2994a")
+        self.status.configure(text="typing into composer…", foreground="#f2994a")
         username = self._username()
         uid = self._user_id()
 
         def worker() -> None:
             try:
-                send_dm(username, text)
-                core.record_sent(uid, text)
-                core.add_event(uid, "DM_SENT", text[:200])
-                self.app.after(0, self._mark_sent)
+                echoed = send_message(username, text)
+                self.app.after(0, lambda echoed=echoed: self._mark_typed(echoed))
             except Exception as exc:
                 err = str(exc)
-                _dbg(f"sweep send FAILED @{username}: {type(exc).__name__}: {exc}")
+                _dbg(f"sweep send(compose) FAILED @{username}: {type(exc).__name__}: {exc}")
                 self.app.after(0, lambda err=err: self._mark_fail(err))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def confirm_sent(self) -> None:
+        """Record the DM as sent after the human clicks Send in X."""
+        if self.done and self._sent_recorded:
+            return
+        text = self.msg.get("1.0", "end-1c").strip()
+        if not text:
+            self.status.configure(text="nothing to record", foreground="#e74c3c")
+            return
+        self._sent_recorded = True
+        try:
+            core.record_sent(self._user_id(), text)
+            core.add_event(self._user_id(), "DM_SENT", text[:200])
+        except Exception as exc:
+            _dbg(f"confirm_sent record FAILED: {exc}")
+            self.status.configure(text=f"record failed — {str(exc)[:50]}", foreground="#e74c3c")
+            self._sent_recorded = False
+            return
+        self.status.configure(text="✓ recorded as sent", foreground="#27ae60")
 
     def skip(self) -> None:
         if self.done:
@@ -197,8 +217,10 @@ class _SweepRow:
         self._set_running(True)
         self.status.configure(text="skipped", foreground="#8a94a6")
 
-    def _mark_sent(self) -> None:
-        self.status.configure(text="✓ sent", foreground="#27ae60")
+    def _mark_typed(self, echoed: str) -> None:
+        self.status.configure(
+            text="typed — press Send in X now, then 'Confirm sent'",
+            foreground="#2d7ff9")
 
     def _mark_fail(self, err: str) -> None:
         _dbg(f"_SweepRow _mark_fail: {err[:200]}")
@@ -246,17 +268,17 @@ class XAgentApp(tk.Tk):
         )
 
         ttk.Button(side, text="Set app link", command=self.ask_set_link).grid(
-            row=6, column=0, sticky="ew", pady=(0, 6)
-        )
-        ttk.Button(side, text="Set X credentials", command=self.ask_set_credentials).grid(
-            row=7, column=0, sticky="ew", pady=(0, 10)
+            row=6, column=0, sticky="ew", pady=(0, 10)
         )
 
         ttk.Label(
             side,
-            text=("Run sweep refreshes each user's profile + recent posts + DMs "
-                  "from the X API, figures out who needs a message, and shows a "
-                  "Send/Skip row per person.\n\n"
+            text=("Run sweep reads each user's profile + recent posts + DMs from "
+                  "the agent Chrome, figures out who needs a message, and shows a "
+                  "row per person.\n\n"
+                  "Type into composer = opens the DM in the agent Chrome and "
+                  "types the approved draft into the message box. YOU press the "
+                  "final Send in X, then click 'Confirm sent' to record it.\n\n"
                   "Users without an explicit intent signal (mention, request, "
                   "follow-back) are WATCHED, never messaged — X forbids "
                   "unsolicited DMs. First DMs are only drafted for users who "
@@ -460,14 +482,14 @@ class XAgentApp(tk.Tk):
             return
         handle = handle.strip().lstrip("@")
         _dbg(f"add_by_handle handle={handle}")
-        self._set_busy(True, "Fetching user from X API…")
+        self._set_busy(True, f"Adding @{handle} locally…")
 
         def worker() -> None:
             try:
-                from x_api import fetch_user
-                data = fetch_user(handle)
-                uid = core.upsert_user(data)
-                self.after(0, lambda uid=uid: self._profile_done(uid, f"@{handle} added + profile captured."))
+                uid = core.add_user(handle)
+                self.after(0, lambda uid=uid: self._profile_done(
+                    uid, f"@{handle} added locally. Click 'Read signals' to capture "
+                         "profile + posts from the browser."))
             except Exception as exc:
                 error = str(exc)
                 _dbg(f"add_by_handle FAILED: {exc}")
@@ -485,7 +507,7 @@ class XAgentApp(tk.Tk):
 
         def worker() -> None:
             try:
-                found = search_users(query, count=40)
+                found = search_recent_users(query, count=40)
                 added = 0
                 for u in found:
                     u2 = dict(u)
@@ -624,25 +646,6 @@ class XAgentApp(tk.Tk):
         else:
             self.status_var.set("App link unchanged.")
 
-    def ask_set_credentials(self) -> None:
-        def ask(label: str, current: str) -> str:
-            return simpledialog.askstring("X credentials", label, initialvalue=current or "", show="*", parent=self)
-
-        core.set_setting("X_BEARER_TOKEN", ask("Bearer token (read-only public data):", core.get_setting("X_BEARER_TOKEN")) or "")
-        core.set_setting("X_API_KEY", ask("API key:", core.get_setting("X_API_KEY")) or "")
-        core.set_setting("X_API_SECRET", ask("API secret:", core.get_setting("X_API_SECRET")) or "")
-        core.set_setting("X_ACCESS_TOKEN", ask("Access token:", core.get_setting("X_ACCESS_TOKEN")) or "")
-        core.set_setting("X_ACCESS_SECRET", ask("Access token secret:", core.get_setting("X_ACCESS_SECRET")) or "")
-
-        self.status_var.set("X credentials saved to local DB.")
-        _dbg("X credentials saved via GUI")
-        try:
-            from x_api import verify_credentials
-            verify = verify_credentials()
-            self.status_var.set(f"Credentials verified — connected as {verify}.")
-        except Exception as exc:
-            self.status_var.set(f"Credentials saved, but verification failed: {exc}")
-
     # --- sweep ------------------------------------------------------------------
     def run_sweep(self) -> None:
         _dbg("run_sweep clicked")
@@ -653,7 +656,7 @@ class XAgentApp(tk.Tk):
 
         def worker() -> None:
             _dbg("run_sweep worker START")
-            sess = PlatformSession(do_verify=True)
+            sess = BrowserSession()
             try:
                 groups = self._sweep_read(sess)
                 sess.close()
@@ -669,9 +672,10 @@ class XAgentApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _sweep_read(self, sess: PlatformSession) -> dict[str, list]:
+    def _sweep_read(self, sess: BrowserSession) -> dict[str, list]:
         """Human-paced, resumable sweep pass (mirrors the LinkedIn sweep):
-        refresh signals + DMs for up to 20 users, classify, and return groups."""
+        read signals + DMs for up to 20 users from the browser, classify, and
+        return groups."""
         MAX_PER_SESSION = 20
         sweep_id = core.start_sweep_session(max_per_session=MAX_PER_SESSION)
         work = core.get_sweep_queue(sweep_id, limit=MAX_PER_SESSION)
@@ -741,7 +745,7 @@ class XAgentApp(tk.Tk):
     def _sweep_show(self, groups: dict[str, list]) -> None:
         _dbg("_sweep_show opening review window")
         self._sweep_running = False
-        self._set_busy(False, "Sweep done. Review the steps and press Send per person.")
+        self._set_busy(False, "Sweep done. Review the rows and 'Type into composer' per person.")
 
         win = tk.Toplevel(self)
         win.title("Sweep result — semi-auto steps")
@@ -766,8 +770,9 @@ class XAgentApp(tk.Tk):
         ttk.Label(win, text=summary, font=("Segoe UI", 11, "bold"), anchor="w").pack(
             anchor="w", padx=12, pady=(10, 2))
 
-        ttk.Label(win, text=("Each person below has a draft message. You can edit it before sending. "
-                             "Send = sends the edited text via the X API now. Skip = leave them for later."),
+        ttk.Label(win, text=("Each person below has a draft you can edit. 'Type into composer' opens their DM "
+                             "in the agent Chrome and types the draft into the message box - you press the final "
+                             "Send in X, then click 'Confirm sent' to record it. Skip = leave them for later."),
                   font=("Segoe UI", 9)).pack(anchor="w", padx=12, pady=(2, 4))
 
         canvas = tk.Canvas(win)
