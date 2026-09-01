@@ -76,13 +76,20 @@ def _chrome_exe() -> str:
 
 
 def _cdp_up() -> bool:
-    try:
-        r = requests.get(f"http://127.0.0.1:{CDP_PORT}/json/version", timeout=2)
-        _dbg(f"_cdp_up OK port={CDP_PORT} status={r.status_code}")
-        return r.status_code == 200
-    except Exception as e:
-        _dbg(f"_cdp_up FAIL port={CDP_PORT}: {type(e).__name__}: {e}")
-        return False
+    # Probe twice: the first connect can time out spuriously on this machine
+    # while the port is still actually accepting (documented flake). Declaring
+    # CDP 'down' wrongly relaunches Chrome and kills healthy in-flight pages.
+    for attempt in range(2):
+        try:
+            r = requests.get(f"http://127.0.0.1:{CDP_PORT}/json/version", timeout=3)
+            if r.status_code == 200:
+                _dbg(f"_cdp_up OK port={CDP_PORT} status={r.status_code}")
+                return True
+            _dbg(f"_cdp_up probe {attempt + 1} status={r.status_code}")
+        except Exception as e:
+            _dbg(f"_cdp_up probe {attempt + 1} failed: {type(e).__name__}: {e}")
+    _dbg(f"_cdp_up FAIL port={CDP_PORT}")
+    return False
 
 
 def _clear_profile_locks():
@@ -705,44 +712,66 @@ def _open_thread(context, page: Any, handle: str, timeout_ms: int) -> Any:
     really theirs. Returns the opened thread page or raises a clear error."""
     handle = str(handle).strip().lstrip("@").lower()
     _goto(page, "https://x.com/messages",
-          wait_selector='[data-testid="conversation"], [data-testid="messageEntry"]', timeout_ms=timeout_ms)
-    try:
-        page.wait_for_selector('[data-testid="conversation"]', timeout=12000)
-    except PlaywrightError:
-        pass
-    _human_wait(page, 1000, 2400)  # scan the conversation list before clicking one
+          wait_selector='[data-testid="conversation"], [data-testid="messageEntry"], main',
+          timeout_ms=timeout_ms, wait_timeout_ms=5000)
+    _human_wait(page, 700, 1600)  # let the signed-in inbox settle
+    if _is_logged_out(page):
+        raise RuntimeError(
+            "NOT LOGGED IN - the agent Chrome signed out of X. Log back in at "
+            f"https://x.com/ in the agent Chrome (port {CDP_PORT}) and rerun."
+        )
+    state = _inbox_state(page)
+    if state == "no-access":
+        raise RuntimeError(
+            "DMS UNAVAILABLE - this X account is restricted from the Messages "
+            "inbox. Profiles, posts and search still work; DM reads are skipped."
+        )
+    if state == "loading":
+        # Give the inbox one real chance before declaring it broken.
+        try:
+            page.wait_for_selector('[data-testid="conversation"], [data-testid="messageEntry"]', timeout=8000)
+        except PlaywrightError:
+            pass
+        state = _inbox_state(page)
+        if state == "no-access":
+            raise RuntimeError(
+                "DMS UNAVAILABLE - this X account is restricted from the Messages "
+                "inbox. Profiles, posts and search still work; DM reads are skipped."
+            )
+        if state == "loading":
+            raise RuntimeError(
+                "NO DM INBOX - the agent Chrome is on X but the Messages page never "
+                "rendered the inbox. Open https://x.com/messages in the agent Chrome "
+                "once to confirm it loads, then rerun."
+            )
 
-    state_checked = False
     for _ in range(6):
-        state_checked = True
         try:
             clicked = bool(page.evaluate(_OPEN_THREAD_JS, handle))
         except PlaywrightError:
             clicked = False
         if clicked:
             break
-        _human_wait(page, 600, 1100)
-    if not clicked and not page.evaluate("() => document.querySelectorAll('[data-testid=conversation]').length"):
-        raise RuntimeError(
-            "NO DM INBOX - the agent Chrome is on X but the Messages inbox did not "
-            "load. Open https://x.com/messages in the agent Chrome once (you must "
-            "have DMs available on your X account) and rerun."
+        _human_wait(page, 550, 1000)
+    if not clicked:
+        raise NoThreadError(
+            f"No DM conversation with @{handle} exists yet - the inbox is loaded "
+            "but has no thread for them (a normal state, not an error)."
         )
 
     # Verify the opened conversation belongs to @handle before reading it.
     verified = False
     thread = page
-    for _ in range(16):
+    for _ in range(12):
         thread = page
         try:
             ver = thread.evaluate(_VERIFY_THREAD_JS, handle) or {}
         except PlaywrightError:
             ver = {}
-        if ver.get("entries") or ver.get("header"):
-            if ver.get("header"):
-                verified = True
-                break
-        _human_wait(thread, 500, 950)
+        if ver.get("header"):
+            verified = True
+            break
+        _human_wait(thread, 450, 900)
     if not verified:
         raise RuntimeError(
             f"COULD NOT VERIFY - X did not confirm the open DM thread belongs to "
@@ -772,7 +801,11 @@ def fetch_dm_thread(handle: str, display_name: str | None = None,
         before = {id(p) for p in context.pages}
         page = context.new_page()
         try:
-            thread = _open_thread(context, page, str(handle).strip().lstrip("@"), timeout_ms)
+            try:
+                thread = _open_thread(context, page, str(handle).strip().lstrip("@"), timeout_ms)
+            except NoThreadError:
+                _dbg(f"fetch_dm_thread @{handle} no thread yet -> empty")
+                return []
             got: list[dict[str, str]] = []
             for _attempt in range(3):
                 try:
@@ -795,6 +828,39 @@ def fetch_dm_thread(handle: str, display_name: str | None = None,
             if teardown:
                 browser.close()
                 pw.stop()
+
+
+class NoThreadError(RuntimeError):
+    """The X inbox loaded fine, but there is no DM conversation with the
+    requested handle. A normal state - an empty thread just yields no
+    messages, it is never a sweep failure."""
+
+
+_INBOX_LOADED_TEXT = re.compile(
+    r"empty inbox|start conversation|message someone|new chat|choose from your existing",
+    re.I)
+
+_INBOX_NO_ACCESS_TEXT = re.compile(
+    r"you don'?t have access|not available|not permitted|"
+    r"you can'?t send messages|messages are limited|must follow",
+    re.I)
+
+
+def _inbox_state(page: Any) -> str:
+    """Describe the X Messages inbox as rendered: 'loaded' (rows exist),
+    'empty' (loaded, no rows), 'no-access' (account restricted), or
+    'loading' (no decision yet - needs more time or is genuinely broken)."""
+    if page.query_selector('[data-testid="conversation"]'):
+        return "loaded"
+    try:
+        t = (page.evaluate("() => document.body ? document.body.innerText : ''") or "")[:1600]
+    except Exception:
+        t = ""
+    if _INBOX_NO_ACCESS_TEXT.search(t):
+        return "no-access"
+    if _INBOX_LOADED_TEXT.search(t):
+        return "empty"
+    return "loading"
 
 
 # ---------------------------------------------------------------------------
@@ -857,7 +923,14 @@ def send_message(handle: str, text: str, timeout_ms: int = 40000,
         before = {id(p) for p in context.pages}
         page = context.new_page()
         try:
-            thread = _open_thread(context, page, str(handle).strip().lstrip("@"), timeout_ms)
+            try:
+                thread = _open_thread(context, page, str(handle).strip().lstrip("@"), timeout_ms)
+            except NoThreadError:
+                raise RuntimeError(
+                    f"No DM conversation with @{handle} exists yet, so there is no "
+                    "composer to type into. Open their profile in the agent Chrome "
+                    "and click 'Message' once to start the thread, then rerun."
+                ) from None
             _human_wait(thread, 1400, 3400)  # read the last messages before replying
             focused = False
             for _ in range(6):
