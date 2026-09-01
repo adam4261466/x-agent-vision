@@ -791,6 +791,11 @@ class XAgentApp(tk.Tk):
         if not rows:
             ttk.Label(body, text="Everyone is either waiting, watching, or already done — nothing to do this pass.",
                       ).pack(anchor="w", padx=10, pady=20)
+            ttk.Label(body, text=("People only become actionable after an intent signal (DM reply, mention, request). "
+                                  "Profiles and posts were still captured for everyone this pass. If your inbox is empty, "
+                                  "start a conversation with someone in the agent Chrome (open their profile → Message) "
+                                  "and the next sweep will pick up the thread."),
+                      foreground="#555", font=("Segoe UI", 9), wraplength=900).pack(anchor="w", padx=10)
 
     def _sweep_status(self, msg: str) -> None:
         self.status_var.set(msg)

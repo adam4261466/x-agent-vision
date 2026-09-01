@@ -261,7 +261,7 @@ def set_user_scores(user_id: int, icp: int = 0, problem: int = 0) -> None:
 # ---------------------------------------------------------------------------
 
 def start_sweep_session(max_per_session: int = 20) -> str:
-    sweep_id = f"sweep_{int(datetime.now().timestamp())}"
+    sweep_id = f"sweep_{int(datetime.now().timestamp() * 1000)}"
     now = utc_now()
     with connect() as db:
         db.execute("""
@@ -275,13 +275,24 @@ def start_sweep_session(max_per_session: int = 20) -> str:
 
 
 def get_sweep_queue(sweep_id: str, limit: int = 20) -> list:
+    """Next `limit` users for this sweep session, advancing through the whole
+    CRM instead of re-reading the same group every pass:
+      1) users never successfully read before (discovery)
+      2) then those read longest ago (LRU re-validation rotation)
+    '#read' comes from any previous sweep session, so progress persists and a
+    blocked user floats back up next pass."""
     with connect() as db:
         rows = db.execute("""
             SELECT u.*
             FROM users u
             JOIN sweep_state s ON s.user_id = u.id AND s.sweep_id = ?
             WHERE s.status = 'pending'
-            ORDER BY u.id
+            ORDER BY
+                (SELECT COUNT(*) FROM sweep_state s2
+                   WHERE s2.user_id = u.id AND s2.status = 'read') ASC,
+                (SELECT MAX(s2.created_at) FROM sweep_state s2
+                   WHERE s2.user_id = u.id AND s2.status = 'read') ASC,
+                u.id
             LIMIT ?
         """, (sweep_id, limit)).fetchall()
         return rows
