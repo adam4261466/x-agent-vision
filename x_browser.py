@@ -386,6 +386,40 @@ _PROFILE_NAME_JS = """() => {
     return out;
 }"""
 
+_FOLLOWS_YOU_JS = """() => {
+    const body = document.body ? document.body.innerText : '';
+    return /Follows you/.test(body.slice(0, 5000));
+}"""
+
+_FOLLOW_BTN_JS = """() => {
+    const btns = Array.from(document.querySelectorAll('button'));
+    for (const b of btns) {
+        const tid = (b.getAttribute('data-testid') || '');
+        if (/^\\d+-unfollow$/.test(tid)) return {following: true, testid: tid};
+        if (/^\\d+-follow$/.test(tid)) return {following: false, testid: tid};
+    }
+    const spans = Array.from(document.querySelectorAll('div[role="button"]'));
+    for (const b of spans) {
+        const tid = (b.getAttribute('data-testid') || '');
+        if (/^\\d+-unfollow$/.test(tid)) return {following: true, testid: tid};
+        if (/^\\d+-follow$/.test(tid)) return {following: false, testid: tid};
+    }
+    return {following: null, testid: ''};
+}"""
+
+_FOLLOW_CLICK_JS = """() => {
+    const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
+    for (const b of btns) {
+        if (b.offsetParent === null) continue;
+        const tid = (b.getAttribute('data-testid') || '');
+        if (/^\\d+-follow$/.test(tid)) {
+            b.click();
+            return {clicked: true, testid: tid};
+        }
+    }
+    return {clicked: false};
+}"""
+
 
 def _profile_fetch(page: Any, handle: str, timeout_ms: int) -> dict[str, Any]:
     url = f"https://x.com/{handle}"
@@ -418,6 +452,10 @@ def _profile_fetch(page: Any, handle: str, timeout_ms: int) -> dict[str, Any]:
         )
     _dbg(f"_profile_fetch @{handle} name={out.get('name')!r} bio_len={len(out.get('bio') or '')} "
          f"followers={out.get('followers')}")
+    try:
+        out["follows_you"] = bool(page.evaluate(_FOLLOWS_YOU_JS))
+    except PlaywrightError:
+        out["follows_you"] = False
     _human_wait(page, 700, 1700)          # linger before moving on to the next tab
     return {
         "username": (out.get("handle") or handle).lstrip("@").lower(),
@@ -429,6 +467,7 @@ def _profile_fetch(page: Any, handle: str, timeout_ms: int) -> dict[str, Any]:
         "following_count": out.get("following") or 0,
         "post_count": out.get("posts") or 0,
         "verified": bool(out.get("verified")),
+        "follows_you": bool(out.get("follows_you")),
     }
 
 
@@ -606,12 +645,15 @@ _SEARCH_AUTHORS_JS = """() => {
 }"""
 
 
-def search_recent_users(query: str, count: int = 40, scroll_rounds: int = 3,
-                        timeout_ms: int = 40000,
+def search_recent_users(query: str, count: int = 40, scroll_rounds: int = 12,
+                        timeout_ms: int = 60000,
                         session: BrowserSession | None = None) -> list[dict[str, Any]]:
     """Search recent tweets on x.com and return the unique author handles with
     their display names, at a human reading pace (variable scroll pauses, no
-    bulk scanning). Profile details come later via fetch_profile_page."""
+    bulk scanning). Keeps scrolling the same search over many rounds until it
+    collects `count` unique authors (or the results run dry), so a target
+    number of candidates can be reached. Profile details come later via
+    fetch_profile_page."""
     _dbg(f"search_recent_users START query={query!r} count={count}")
     with _BROWSER_LOCK:
         pw = browser = context = None
@@ -634,6 +676,7 @@ def search_recent_users(query: str, count: int = 40, scroll_rounds: int = 3,
             _human_wait(page, 1300, 2800)  # scan the first results before scrolling
             users: list[dict[str, Any]] = []
             seen: set[str] = set()
+            stagnant = 0
             for _r in range(scroll_rounds):
                 try:
                     page.evaluate(_SCROLL_TIMELINE_JS)
@@ -641,12 +684,20 @@ def search_recent_users(query: str, count: int = 40, scroll_rounds: int = 3,
                     pass
                 _human_wait(page, 1400, 3000)
                 _jitter_scroll(page)
+                new_in_round = 0
                 for u in page.evaluate(_SEARCH_AUTHORS_JS) or []:
                     h = (u.get("username") or "").lower()
                     if h and h not in seen:
                         seen.add(h)
                         users.append(u)
+                        new_in_round += 1
+                if new_in_round == 0:
+                    stagnant += 1
+                else:
+                    stagnant = 0
                 if len(users) >= count:
+                    break
+                if stagnant >= 4:   # nothing new after several scrolls -> exhausted
                     break
             _dbg(f"search_recent_users query={query!r} unique={len(users)}")
             _human_wait(page, 700, 1500)  # linger before leaving the search
@@ -992,25 +1043,31 @@ _HAS_COMPOSER_JS = """() => {
 }"""
 
 _OPEN_PROFILE_MESSAGE_JS = """() => {
-    const nodes = Array.from(document.querySelectorAll('a,button'));
-    for (const n of nodes) {
-        if (n.offsetParent === null) continue;
+    const isNav = (n) => {
+        const tid = (n.getAttribute('data-testid') || '').toLowerCase();
+        const href = (n.getAttribute('href') || '').trim();
+        if (tid.indexOf('apptabbar') !== -1 || tid.indexOf('directmessage') !== -1) return true;
+        if (href === '/messages' || href === '/i/chat' || href === '/i/connect') return true;
+        return false;
+    };
+    const isMsg = (n) => {
         const href = (n.getAttribute('href') || '').trim();
         const aria = (n.getAttribute('aria-label') || '').toLowerCase().replace(/\\s+/g, '');
-        const txt = (n.innerText || '').toLowerCase().replace(/\\s+/g, '');
-        const testid = (n.getAttribute('data-testid') || '').toLowerCase();
-        const isMsgLink = /^\\/messages\\/(compose|new)/.test(href)
-            || href.indexOf('/messages/compose') !== -1;
-        const ariaMsg = aria === 'message'
-            || aria.indexOf('message@') === 0
-            || aria.indexOf('send message') === 0
-            || aria === 'sendmessage';
-        const txtMsg = txt === 'message' || txt === 'sendmessage';
-        const tidMsg = (testid.indexOf('message') !== -1 || testid.indexOf('dm') !== -1)
-            && testid.indexOf('follow') === -1 && testid.indexOf('block') === -1;
-        if (isMsgLink || ariaMsg || txtMsg || tidMsg) {
+        const txt = (n.innerText || '').toLowerCase().trim();
+        const tid = (n.getAttribute('data-testid') || '').toLowerCase();
+        if (isNav(n)) return false;
+        if (/senddmfromprofile|sendmessage|senddm|dmcomposer/.test(tid)) return true;
+        if (/\\/messages\\/(compose|new)(\\?|$)/.test(href) && /recipient_id/.test(href)) return true;
+        if (aria === 'message' || aria === 'sendmessage'
+            || aria.indexOf('message@') === 0 || aria.indexOf('send message') === 0) return true;
+        if (txt === 'message' || txt === 'send message') return true;
+        return false;
+    };
+    for (const n of Array.from(document.querySelectorAll('a,button,[role="button"]'))) {
+        if (n.offsetParent === null) continue;
+        if (isMsg(n)) {
             n.click();
-            return {clicked: true, url: href};
+            return {clicked: true, url: n.getAttribute('href') || ''};
         }
     }
     return {clicked: false, url: ''};
@@ -1019,6 +1076,88 @@ _OPEN_PROFILE_MESSAGE_JS = """() => {
 _PROFILE_DM_BLOCKED_JS = """() => {
     const t = (document.body ? document.body.innerText : '') || '';
     if (/(can'?t send messages to this account|doesn'?t accept direct messages|dm (requests are )?closed|doesn'?t allow direct messages)/i.test(t.slice(0, 4000))) return true;
+    return false;
+}"""
+
+_PROFILE_MESSAGE_PRESENT_JS = """() => {
+    const isNav = (n) => {
+        const tid = (n.getAttribute('data-testid') || '').toLowerCase();
+        const href = (n.getAttribute('href') || '').trim();
+        if (tid.indexOf('apptabbar') !== -1 || tid.indexOf('directmessage') !== -1) return true;
+        if (href === '/messages' || href === '/i/chat' || href === '/i/connect') return true;
+        return false;
+    };
+    const isMsg = (n) => {
+        const href = (n.getAttribute('href') || '').trim();
+        const aria = (n.getAttribute('aria-label') || '').toLowerCase().replace(/\\s+/g, '');
+        const txt = (n.innerText || '').toLowerCase().trim();
+        const tid = (n.getAttribute('data-testid') || '').toLowerCase();
+        if (isNav(n)) return false;
+        if (/senddmfromprofile|sendmessage|senddm|dmcomposer/.test(tid)) return true;
+        if (/\\/messages\\/(compose|new)(\\?|$)/.test(href) && /recipient_id/.test(href)) return true;
+        if (aria === 'message' || aria === 'sendmessage'
+            || aria.indexOf('message@') === 0 || aria.indexOf('send message') === 0) return true;
+        if (txt === 'message' || txt === 'send message') return true;
+        return false;
+    };
+    for (const n of Array.from(document.querySelectorAll('a,button,[role="button"]'))) {
+        if (n.offsetParent === null) continue;
+        if (isMsg(n)) return true;
+    }
+    return false;
+}"""
+
+_DM_NEW_MESSAGE_JS = """() => {
+    const nodes = Array.from(document.querySelectorAll('a,button'));
+    for (const n of nodes) {
+        if (n.offsetParent === null) continue;
+        const href = (n.getAttribute('href') || '').trim();
+        const aria = (n.getAttribute('aria-label') || '').toLowerCase().replace(/\\s+/g, '');
+        const txt = (n.innerText || '').toLowerCase().replace(/\\s+/g, '');
+        const testid = (n.getAttribute('data-testid') || '').toLowerCase();
+        if (/^\\/messages\\/(compose|new)/.test(href)
+            || aria === 'newmessage' || aria.indexOf('new message') === 0
+            || txt === 'newmessage' || txt === 'message'
+            || testid === 'dmnewmessagebutton'
+            || /newmessage|dmnewmessage/.test(testid)) {
+            n.click();
+            return {clicked: true, url: href};
+        }
+    }
+    return {clicked: false, url: ''};
+}"""
+
+_DM_SEARCH_INPUT_JS = """() => {
+    const sels = [
+        'input[data-testid="dmSearchInput"]',
+        'div[data-testid="dmSearchBox"] input',
+        'input[placeholder*="Search people"]',
+        'input[placeholder*="Search"]',
+        'input[role="combobox"]',
+        'div[data-testid="cellInnerDiv"] input',
+        'dialog input'
+    ];
+    for (const s of sels) {
+        const el = document.querySelector(s);
+        if (el && el.offsetParent !== null) { el.focus(); el.click(); return true; }
+    }
+    return false;
+}"""
+
+_DM_RESULT_JS = """(handle) => {
+    const h = String(handle || '').toLowerCase();
+    let rows = Array.from(document.querySelectorAll('div[role="option"]'));
+    if (!rows.length) rows = Array.from(document.querySelectorAll('div[data-testid="cellInnerDiv"]'));
+    for (const r of rows) {
+        if (r.offsetParent === null) continue;
+        const link = r.querySelector('a[href^="/"]');
+        const lh = link ? (link.getAttribute('href') || '').toLowerCase() : '';
+        const t = (r.innerText || '') || '';
+        if (lh === '/' + h || t.toLowerCase().indexOf('@' + h) !== -1) {
+            (link || r).click();
+            return true;
+        }
+    }
     return false;
 }"""
 
@@ -1085,11 +1224,87 @@ def _profile_dm_closed(page: Any) -> bool:
         return False
 
 
-def _open_dm_composer(context, page: Any, handle: str, timeout_ms: int) -> Any:
-    """Open a DM composer with @handle. Preferred route: the profile's
-    'Message' button (works even with no existing conversation), re-scanned a
-    few times because the header hydrates asynchronously. Falls back to the
-    inbox thread search."""
+def _open_dm_via_search(context, page: Any, handle: str, timeout_ms: int) -> Any:
+    """Open a DM composer with @handle through the Messages recipient search:
+    New message -> type their name/handle into the search field -> Enter.
+    This works even when the profile page shows no 'Message' button, because
+    X's composer resolves any account by name."""
+    handle = str(handle).strip().lstrip("@").lower()
+    _goto(page, "https://x.com/messages",
+          wait_selector='[data-testid="conversation"], [data-testid="messageEntry"], main',
+          timeout_ms=timeout_ms, wait_timeout_ms=6000)
+    _human_wait(page, 800, 1800)  # let the signed-in inbox settle
+    state = _inbox_state(page)
+    if state == "no-access":
+        raise RuntimeError(
+            "DMS UNAVAILABLE - this X account is restricted from the Messages "
+            "inbox. Profiles, posts and search still work; DM sends are skipped."
+        )
+
+    opened = False
+    for _ in range(6):
+        try:
+            out = page.evaluate(_DM_NEW_MESSAGE_JS) or {}
+        except PlaywrightError:
+            out = {}
+        if out.get("clicked"):
+            opened = True
+            _dbg(f"_open_dm_via_search @{handle} 'New message' clicked")
+            break
+        _human_wait(page, 700, 1300)
+    if not opened and "/messages/compose" in page.url:
+        opened = True
+    if not opened:
+        _goto(page, "https://x.com/messages/compose",
+              wait_selector="main", timeout_ms=timeout_ms)
+        _human_wait(page, 1200, 2400)
+
+    focused = False
+    for _ in range(10):
+        try:
+            focused = bool(page.evaluate(_DM_SEARCH_INPUT_JS))
+        except PlaywrightError:
+            focused = False
+        if focused:
+            break
+        _human_wait(page, 700, 1200)
+    if not focused:
+        raise RuntimeError(
+            f"Could not find the DM recipient search field on x.com/messages "
+            f"(needed to open @{handle} by name)."
+        )
+    _human_wait(page, 300, 700)
+
+    _type_human(page, handle)
+    picked = False
+    for _ in range(12):
+        _human_wait(page, 600, 1100)
+        try:
+            if page.evaluate(_DM_RESULT_JS, handle):
+                picked = True
+                _dbg(f"_open_dm_via_search @{handle} picked search result")
+                break
+        except PlaywrightError:
+            pass
+    if not picked:
+        page.keyboard.press("Enter")
+        _human_wait(page, 1000, 2000)
+        _dbg(f"_open_dm_via_search @{handle} pressed Enter on the search result")
+
+    if _has_composer(page):
+        _human_wait(page, 900, 1800)
+        return page
+    raise RuntimeError(
+        f"Searched the DM composer for @{handle} and confirmed the search, but "
+        "the composer to them never opened. They likely have DMs closed, or X "
+        "restricts messaging this account."
+    )
+
+
+def _open_dm_via_profile(context, page: Any, handle: str, timeout_ms: int) -> Any:
+    """Fallback: open a DM composer from the profile's 'Message' button,
+    re-scanned a few times because the header hydrates asynchronously. Falls
+    back to the inbox thread search."""
     handle = str(handle).strip().lstrip("@").lower()
     _goto(page, f"https://x.com/{handle}", wait_selector="main", timeout_ms=timeout_ms)
     opened = False
@@ -1101,7 +1316,7 @@ def _open_dm_composer(context, page: Any, handle: str, timeout_ms: int) -> Any:
             out = {}
         if out.get("clicked"):
             opened = True
-            _dbg(f"_open_dm_composer @{handle} 'Message' clicked (attempt {attempt + 1})")
+            _dbg(f"_open_dm_via_profile @{handle} 'Message' clicked (attempt {attempt + 1})")
             break
         if _profile_dm_closed(page):
             raise RuntimeError(
@@ -1133,6 +1348,19 @@ def _open_dm_composer(context, page: Any, handle: str, timeout_ms: int) -> Any:
         "conversation. They likely have DMs closed, or X restricts messaging "
         "this account."
     )
+
+
+def _open_dm_composer(context, page: Any, handle: str, timeout_ms: int) -> Any:
+    """Open a DM composer with @handle. Preferred route: search their name in
+    the Messages recipient search and open the thread there (works even when
+    the profile has no visible 'Message' button). Falls back to the profile
+    'Message' button, then the inbox thread."""
+    handle = str(handle).strip().lstrip("@").lower()
+    try:
+        return _open_dm_via_search(context, page, handle, timeout_ms)
+    except RuntimeError as exc:
+        _dbg(f"_open_dm_composer @{handle} search route failed, trying profile button: {exc}")
+    return _open_dm_via_profile(context, page, handle, timeout_ms)
 
 
 def send_dm(handle: str, text: str, verification_code: str = "1234",
@@ -1174,7 +1402,7 @@ def send_dm(handle: str, text: str, verification_code: str = "1234",
             if not focused:
                 raise RuntimeError(
                     f"Could not find the DM composer for @{handle} after opening "
-                    "their profile -> Message."
+                    "it via the Messages search."
                 )
             _type_human(thread, text)
             _human_wait(thread, 600, 1400)
@@ -1218,6 +1446,138 @@ def send_dm(handle: str, text: str, verification_code: str = "1234",
                 "account verification (unverified sending profile), do that in "
                 "the agent Chrome once, then retry."
             )
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+            _close_stray_pages(context, before)
+            if teardown:
+                browser.close()
+                pw.stop()
+
+
+def profile_can_dm(handle: str, timeout_ms: int = 40000,
+                   session: BrowserSession | None = None,
+                   max_followers: int | None = None) -> dict[str, Any]:
+    """Open @handle's profile and report whether X shows a 'Message' DM button
+    (i.e. we could send them a first DM). Does NOT click it. Used before adding
+    a prospect so only messageable accounts enter the CRM.
+
+    Returns {"can_dm": bool, "reason": str, "follows_you": bool,
+             "followers_count": int}."""
+    handle = str(handle).strip().lstrip("@").lower()
+    _dbg(f"profile_can_dm START handle={handle!r}")
+    with _BROWSER_LOCK:
+        pw = browser = context = None
+        teardown = session is None
+        if session is not None:
+            context = session.context
+        else:
+            pw, browser, context = _connect_sync()
+        before = {id(p) for p in context.pages}
+        page = context.new_page()
+        try:
+            _goto(page, f"https://x.com/{handle}", wait_selector="main", timeout_ms=timeout_ms)
+            _human_wait(page, 900, 1500)  # let the profile header hydrate
+            follows_you = False
+            followers_count = 0
+            following_count = 0
+            try:
+                pfout = page.evaluate(_PROFILE_NAME_JS) or {}
+                followers_count = int(pfout.get("followers") or 0)
+                following_count = int(pfout.get("following") or 0)
+                follows_you = bool(page.evaluate(_FOLLOWS_YOU_JS))
+            except PlaywrightError:
+                pass
+            for _ in range(8):
+                _human_wait(page, 900, 1500)
+                try:
+                    if page.evaluate(_PROFILE_MESSAGE_PRESENT_JS):
+                        _dbg(f"profile_can_dm @{handle} -> TRUE (message button present)")
+                        return {"can_dm": True, "reason": "",
+                                "follows_you": follows_you,
+                                "followers_count": followers_count,
+                                "following_count": following_count}
+                except PlaywrightError:
+                    pass
+                if _profile_dm_closed(page):
+                    return {"can_dm": False,
+                            "reason": "their profile shows a 'can't message this account' notice",
+                            "follows_you": follows_you,
+                            "followers_count": followers_count,
+                            "following_count": following_count}
+            return {"can_dm": False,
+                    "reason": "no 'Message' button on their profile (DMs closed or account restricted)",
+                    "follows_you": follows_you,
+                    "followers_count": followers_count,
+                    "following_count": following_count}
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+            _close_stray_pages(context, before)
+            if teardown:
+                browser.close()
+                pw.stop()
+
+
+def follow_user(handle: str, timeout_ms: int = 40000,
+                session: BrowserSession | None = None) -> dict[str, str]:
+    """Open @handle's profile and click Follow (if not already following).
+    Returns {"status": "followed"|"already"|"not_found"|"error", "reason": str}."""
+    handle = str(handle).strip().lstrip("@").lower()
+    _dbg(f"follow_user START handle={handle!r}")
+    with _BROWSER_LOCK:
+        pw = browser = context = None
+        teardown = session is None
+        if session is not None:
+            context = session.context
+        else:
+            pw, browser, context = _connect_sync()
+        before = {id(p) for p in context.pages}
+        page = context.new_page()
+        try:
+            _goto(page, f"https://x.com/{handle}", wait_selector="main", timeout_ms=timeout_ms)
+            _human_wait(page, 1200, 2400)
+            btn = {}
+            for _ in range(6):
+                try:
+                    btn = page.evaluate(_FOLLOW_BTN_JS) or {}
+                except PlaywrightError:
+                    btn = {}
+                if btn.get("following") is not None:
+                    break
+                _human_wait(page, 800, 1500)
+            if btn.get("following") is True:
+                _dbg(f"follow_user @{handle} -> already following")
+                return {"status": "already", "reason": "already following this account"}
+            if btn.get("following") is None:
+                _dbg(f"follow_user @{handle} -> no follow button found")
+                return {"status": "not_found", "reason": "could not find a Follow button on their profile"}
+            try:
+                click_out = page.evaluate(_FOLLOW_CLICK_JS) or {}
+            except PlaywrightError:
+                click_out = {}
+            if not click_out.get("clicked"):
+                _dbg(f"follow_user @{handle} -> click failed")
+                return {"status": "error", "reason": "found Follow button but could not click it"}
+            _human_wait(page, 1200, 2400)
+            for _ in range(6):
+                try:
+                    btn = page.evaluate(_FOLLOW_BTN_JS) or {}
+                except PlaywrightError:
+                    btn = {}
+                if btn.get("following") is True:
+                    _dbg(f"follow_user @{handle} -> followed OK")
+                    return {"status": "followed", "reason": ""}
+                _human_wait(page, 800, 1500)
+            _dbg(f"follow_user @{handle} -> click sent but could not verify Following state")
+            return {"status": "followed", "reason": "click sent but follow state not confirmed"}
+        except Exception as exc:
+            _dbg(f"follow_user @{handle} ERROR: {type(exc).__name__}: {exc}")
+            return {"status": "error", "reason": str(exc)[:200]}
         finally:
             try:
                 page.close()

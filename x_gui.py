@@ -20,7 +20,8 @@ from datetime import datetime
 from tkinter import messagebox, simpledialog, ttk
 
 import x_agent as core
-from x_browser import BrowserSession, search_recent_users, send_dm, send_message
+from x_browser import (BrowserSession, profile_can_dm, follow_user,
+                       search_recent_users, send_dm, send_message)
 
 _LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "x_gui_debug.log")
 
@@ -299,18 +300,24 @@ class XAgentApp(tk.Tk):
         ttk.Button(side, text="🔎 Discover from search", command=self.discover_search).grid(
             row=3, column=0, sticky="ew", pady=(0, 6)
         )
+        ttk.Button(side, text="✓ Check Message buttons (all)", command=self.recheck_dms).grid(
+            row=4, column=0, sticky="ew", pady=(0, 6)
+        )
+        ttk.Button(side, text="👥 Follow targets (balanced)", command=self.follow_targets).grid(
+            row=5, column=0, sticky="ew", pady=(0, 6)
+        )
         self.sweep_btn = ttk.Button(side, text="▶ Run sweep", command=self.run_sweep)
-        self.sweep_btn.grid(row=4, column=0, sticky="ew", pady=(0, 6), ipady=4)
+        self.sweep_btn.grid(row=6, column=0, sticky="ew", pady=(0, 6), ipady=4)
         ttk.Button(side, text="Refresh", command=self.refresh_all).grid(
-            row=5, column=0, sticky="ew", pady=(0, 10)
+            row=7, column=0, sticky="ew", pady=(0, 10)
         )
 
         ttk.Button(side, text="Set app link", command=self.ask_set_link).grid(
-            row=6, column=0, sticky="ew", pady=(0, 10)
+            row=8, column=0, sticky="ew", pady=(0, 10)
         )
 
         ttk.Button(side, text="Settings…", command=self.ask_settings).grid(
-            row=7, column=0, sticky="ew", pady=(0, 10)
+            row=9, column=0, sticky="ew", pady=(0, 10)
         )
 
         ttk.Label(
@@ -532,10 +539,18 @@ class XAgentApp(tk.Tk):
 
         def worker() -> None:
             try:
+                chk = profile_can_dm(handle)
+                if not chk.get("can_dm"):
+                    reason = chk.get("reason", "unknown")
+                    self.after(0, lambda reason=reason: self._profile_error(
+                        f"@{handle} NOT added: {reason}. Only accounts showing a "
+                        "'Message' button are added."))
+                    return
                 uid = core.add_user(handle)
                 self.after(0, lambda uid=uid: self._profile_done(
-                    uid, f"@{handle} added locally. Click 'Read signals' to capture "
-                         "profile + posts from the browser."))
+                    uid, f"@{handle} added locally (Message button confirmed). "
+                         "Click 'Read signals' to capture profile + posts "
+                         "from the browser."))
             except Exception as exc:
                 error = str(exc)
                 _dbg(f"add_by_handle FAILED: {exc}")
@@ -543,33 +558,192 @@ class XAgentApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def recheck_dms(self) -> None:
+        _dbg("recheck_dms clicked")
+        total = len([r for r in core.search_users(query="", limit=100000) if not r.get("eliminated")])
+        if not messagebox.askyesno(
+                "Re-check Message buttons",
+                f"Open all {total} active profiles in the agent Chrome one by one "
+                f"and keep only accounts with a 'Message' button?\n\n"
+                "Accounts without one get marked eliminated. This visits "
+                f"~{total} profiles (about 10s each).", parent=self):
+            return
+        self._set_busy(True, f"Re-checking Message buttons on {total} profiles one by one…")
+
+        def worker() -> None:
+            kept = 0
+            dropped = 0
+            errors = 0
+            try:
+                for row in core.search_users(query="", limit=100000):
+                    if row.get("eliminated"):
+                        continue
+                    handle = (row.get("username") or "").strip().lstrip("@")
+                    if not handle:
+                        continue
+                    try:
+                        chk = profile_can_dm(handle)
+                    except Exception as exc:
+                        _dbg(f"recheck_dms @{handle} check failed: {exc}")
+                        errors += 1
+                        continue
+                    if chk.get("can_dm"):
+                        kept += 1
+                    else:
+                        reason = chk.get("reason", "no Message button")
+                        _dbg(f"recheck_dms @{handle} ELIMINATED: {reason}")
+                        core.set_eliminated(row["id"], True, reason)
+                        dropped += 1
+                self.after(0, lambda kept=kept, dropped=dropped, errors=errors: self._profile_done(
+                    None, f"Message button re-check: {kept} kept, {dropped} eliminated, "
+                          f"{errors} check failed."))
+                self.after(0, lambda: self.refresh_list())
+            except Exception as exc:
+                error = str(exc)
+                _dbg(f"recheck_dms FAILED: {exc}")
+                self.after(0, lambda error=error: self._profile_error(error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def discover_search(self) -> None:
         _dbg("discover_search clicked")
         query = simpledialog.askstring(
-            "Discover from search", "Search real posts for (e.g. 'pdf extraction pain' or a topic):", parent=self)
+            "Discover from search", "Search topic/target (e.g. 'pdf extraction pain' or an account's niche):",
+            parent=self)
         if not query:
             return
-        self._set_busy(True, f"Searching X: {query[:40]}…")
+        target = simpledialog.askinteger(
+            "Discover from search", "How many qualifying accounts should I collect?",
+            initialvalue=20, minvalue=1, maxvalue=200, parent=self)
+        if not target:
+            return
+        self._set_busy(True, f"Searching X for {target} qualifying accounts (scrolling until reached)…")
 
         def worker() -> None:
+            added = 0
+            skipped = 0
+            raw_needed = min(max(target * 3, 15), 120)
             try:
-                found = search_recent_users(query, count=40)
-                added = 0
-                for u in found:
+                found = search_recent_users(query, count=raw_needed)
+            except Exception as exc:
+                _dbg(f"discover search FAILED: {exc}")
+                self.after(0, lambda error=str(exc): self._profile_error(error))
+                return
+            i = 0
+            try:
+                while added < target and i < len(found):
+                    u = found[i]
+                    i += 1
+                    h = (u.get("username") or "").strip().lstrip("@")
+                    if not h:
+                        continue
+                    self.after(0, lambda added=added, target=target, h=h: self._sweep_status(
+                        f"Discover: {added}/{target} kept — checking @{h}…"))
+                    try:
+                        chk = profile_can_dm(h)
+                    except Exception as exc:
+                        _dbg(f"discover can-dm check failed for @{h}: {exc}")
+                        chk = {"can_dm": False}
+                    if not chk.get("can_dm"):
+                        _dbg(f"discover SKIPPED @{h}: {chk.get('reason')}")
+                        skipped += 1
+                        continue
+                    fc = int(chk.get("followers_count") or 0)
+                    fg = int(chk.get("following_count") or 0)
+                    if not core.is_follow_eligible(fc, fg, 0.20, 400):
+                        _dbg(f"discover SKIPPED @{h}: followers={fc} following={fg} "
+                             f"neither under 400 nor within 20%")
+                        skipped += 1
+                        continue
                     u2 = dict(u)
                     u2["source"] = "search"
+                    u2["followers_count"] = fc
+                    u2["following_count"] = fg
                     try:
                         core.upsert_user(u2)
                         added += 1
                     except Exception as exc:
                         _dbg(f"discover upsert failed: {exc}")
-                self.after(0, lambda added=added: self._profile_done(None,
-                    f"Discovery: found {added} new user(s) for {query!r}. Select one and 'Read signals'."))
+                    if added >= target:
+                        break
+                note = ""
+                if skipped:
+                    note = f", skipped {skipped} (DMs closed, or ≥400 followers & unbalanced)"
+                self.after(0, lambda added=added, note=note: self._profile_done(None,
+                    f"Discovery: kept {added} qualifying user(s) for {query!r} "
+                    f"(Message button + <400 followers OR followers≈following{note}); "
+                    f"searched until reached"
+                    f"{'' if added >= target else ' - no more qualifying results'}."))
                 self.after(0, lambda: self.refresh_list())
             except Exception as exc:
                 error = str(exc)
                 _dbg(f"discover_search FAILED: {exc}")
                 self.after(0, lambda error=error: self._profile_error(error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def follow_targets(self) -> None:
+        """Bulk-follow balanced prospects (followers & following within ~20% of
+        each other) so they follow back, then they become DM-able. Human-paced
+        between each profile."""
+        _dbg("follow_targets clicked")
+        try:
+            targets = core.get_follow_targets(limit=50, balance=0.20, max_followers=400)
+        except Exception as exc:
+            messagebox.showerror("Follow targets", str(exc))
+            return
+        if not targets:
+            self._set_busy(False, "No follow targets: everyone eligible is already followed or none eligible yet.")
+            messagebox.showinfo("Follow targets",
+                                "Nothing to follow. Add prospects first (Discover / Add by @handle); eligible ones are "
+                                "those with under 400 followers OR whose followers/following are within ~20% of each other.",
+                                parent=self)
+            return
+        n = len(targets)
+        if not messagebox.askyesno(
+                "Follow targets",
+                f"Open {n} profile(s) one by one in the agent Chrome and Follow each "
+                f"(under 400 followers OR followers≈following within 20%) so they can "
+                f"follow you back and become DM-able?\n\n"
+                f"Paced ~20-45s apart. X limits follows per day; stop if it starts "
+                f"blocking.", parent=self):
+            return
+        self._set_busy(True, f"Following {n} target(s) one by one…")
+
+        def worker() -> None:
+            ok = 0
+            already = 0
+            failed = 0
+            for i, r in enumerate(targets):
+                h = (r["username"] or "").strip().lstrip("@")
+                if not h:
+                    continue
+                self.after(0, lambda i=i, n=n, h=h: self._sweep_status(
+                    f"Following {i + 1}/{n}: @{h}…"))
+                try:
+                    res = follow_user(h)
+                except Exception as exc:
+                    _dbg(f"follow_targets @{h} ERROR: {exc}")
+                    res = {"status": "error", "reason": str(exc)[:160]}
+                st = res.get("status")
+                if st in ("followed", "already"):
+                    if st == "followed":
+                        core.mark_followed(h)
+                        ok += 1
+                    else:
+                        already += 1
+                else:
+                    failed += 1
+                    _dbg(f"follow_targets @{h} -> {res}")
+                if i < n - 1:
+                    delay = random.uniform(20, 45)
+                    self.after(0, lambda d=delay: self._sweep_status(
+                        f"Following: pausing {d:.0f}s…"))
+                    time.sleep(delay)
+            self.after(0, lambda ok=ok, already=already, failed=failed: self._profile_done(
+                None, f"Follow targets: {ok} followed, {already} already followed, "
+                      f"{failed} failed. Now wait for follow-backs, then run sweep."))
+            self.after(0, lambda: self.refresh_list())
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -868,12 +1042,19 @@ class XAgentApp(tk.Tk):
         """Qualified/discovered prospects with something posted, capped per pass.
 
         Cold (unsolicited) intros are edited and reviewed by the human before the
-        final Send - the cap keeps a sweep from ever becoming a blast."""
+        final Send - the cap keeps a sweep from ever becoming a blast.
+
+        Under X rules, an unverified account can only DM people who follow them,
+        so a cold intro is only offered for a prospect we follow AND who follows
+        us back (follows_you=1). Those waiting on a follow-back are excluded here
+        and surfaced in the sweep summary instead."""
         picked: list = []
         for stage in ("qualified", "discovered"):
             for r in groups.get(stage, []):
                 if len(picked) >= core.max_cold_drafts():
                     return picked
+                if not r["follows_you"]:
+                    continue
                 if core.get_recent_posts(int(r["id"]), max_posts=1):
                     picked.append(r)
         return picked
@@ -906,6 +1087,11 @@ class XAgentApp(tk.Tk):
         if waiting["goal"]:
             parts.append(f"{waiting['goal']} goal done (skipped)")
         watched = waiting["qualified"] + waiting["discovered"] - cold_count
+        followbacks = sum(1 for s in ("qualified", "discovered")
+                          for r in groups.get(s, [])
+                          if int(r["followed"] or 0) and not int(r["follows_you"] or 0))
+        if followbacks:
+            parts.append(f"{followbacks} waiting on a follow-back (you followed, they haven't yet - DM comes once they follow you)")
         if watched > 0:
             cap = core.max_cold_drafts()
             tip = (" (cap reached - raise 'cold drafts per pass' in Settings "

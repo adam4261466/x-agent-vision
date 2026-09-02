@@ -159,6 +159,7 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_sweep_state ON sweep_state(sweep_id,user_id);
         """)
         _ensure_drafts_kind(db)
+        _ensure_follow_columns(db)
         _dbg("init_db done")
 
 
@@ -180,6 +181,20 @@ def _ensure_drafts_kind(db) -> None:
             SELECT id, user_id, kind, content, created_at FROM drafts""")
         db.execute("DROP TABLE drafts")
         db.execute("ALTER TABLE drafts_new RENAME TO drafts")
+
+
+def _ensure_follow_columns(db) -> None:
+    """Add followed / followed_at / follows_you columns if they don't exist yet."""
+    cols = {row["name"] for row in db.execute("PRAGMA table_info(users)").fetchall()}
+    if "followed" not in cols:
+        db.execute("ALTER TABLE users ADD COLUMN followed INTEGER NOT NULL DEFAULT 0")
+        _dbg("migrate: added users.followed")
+    if "followed_at" not in cols:
+        db.execute("ALTER TABLE users ADD COLUMN followed_at TEXT")
+        _dbg("migrate: added users.followed_at")
+    if "follows_you" not in cols:
+        db.execute("ALTER TABLE users ADD COLUMN follows_you INTEGER NOT NULL DEFAULT 0")
+        _dbg("migrate: added users.follows_you")
 
 
 def reset_db() -> None:
@@ -232,23 +247,26 @@ def upsert_user(data: dict[str, Any]) -> int:
             db.execute("""UPDATE users SET
                     user_id=?, display_name=?, bio=?, location=?, website=?,
                     followers_count=?, following_count=?, post_count=?, verified=?,
-                    profile_created_at=?, profile_fetched_at=?, updated_at=?
+                    follows_you=?, profile_created_at=?, profile_fetched_at=?, updated_at=?
                 WHERE id=?""",
                 (data.get("user_id"), display, data.get("bio"), data.get("location"),
                  data.get("website"), int(data.get("followers_count") or 0),
                  int(data.get("following_count") or 0), int(data.get("post_count") or 0),
-                 int(bool(data.get("verified"))), data.get("profile_created_at"), now, now,
+                 int(bool(data.get("verified"))), int(bool(data.get("follows_you"))),
+                 data.get("profile_created_at"), now, now,
                  found["id"]))
             return int(found["id"])
         cur = db.execute("""INSERT INTO users
             (username,user_id,display_name,bio,location,website,followers_count,
-             following_count,post_count,verified,profile_created_at,profile_fetched_at,
+             following_count,post_count,verified,follows_you,
+             profile_created_at,profile_fetched_at,
              status,icp_score,problem_signal,source,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (username, data.get("user_id"), display, data.get("bio"), data.get("location"),
              data.get("website"), int(data.get("followers_count") or 0),
              int(data.get("following_count") or 0), int(data.get("post_count") or 0),
-             int(bool(data.get("verified"))), data.get("profile_created_at"), now,
+             int(bool(data.get("verified"))), int(bool(data.get("follows_you"))),
+             data.get("profile_created_at"), now,
              "discovered", 0, 0, "discovery", now, now))
         return int(cur.lastrowid)
 
@@ -392,6 +410,75 @@ def add_event(user_id: int, event_type: str, content: str = "") -> None:
     with connect() as db:
         db.execute("INSERT INTO events(user_id,event_type,content,created_at) VALUES(?,?,?,?)",
                    (user_id, event_type, content, utc_now()))
+
+
+# ---------------------------------------------------------------------------
+# Follow management (X DM requires mutual follow for unverified accounts)
+# ---------------------------------------------------------------------------
+
+def mark_followed(username: str) -> None:
+    """Record that we followed this user (call after follow_user succeeds)."""
+    username = username.strip().lstrip("@").lower()
+    with connect() as db:
+        db.execute("UPDATE users SET followed=1, followed_at=?, updated_at=? "
+                   "WHERE username=? AND followed=0",
+                   (utc_now(), utc_now(), username))
+        _dbg(f"mark_followed @{username}")
+
+
+def update_follows_you(username: str, follows_you: bool) -> None:
+    """Update the 'follows_you' field from a live profile scan."""
+    username = username.strip().lstrip("@").lower()
+    with connect() as db:
+        db.execute("UPDATE users SET follows_you=?, updated_at=? WHERE username=?",
+                   (int(follows_you), utc_now(), username))
+
+
+def is_follow_eligible(followers: int, following: int, balance: float = 0.20,
+                       max_followers: int = 400) -> bool:
+    """A prospect is a follow target when EITHER:
+      - they have under `max_followers` (default 400) followers (small account), OR
+      - their followers and following counts are within `balance` (default 20%)
+        of each other in both directions (a balanced peer).
+    Any account that is small OR balanced is worth following."""
+
+    def _balanced() -> bool:
+        f = int(followers or 0)
+        g = int(following or 0)
+        if f <= 0 or g <= 0:
+            return False
+        return abs(f - g) * 1.0 / max(f, g) <= balance
+
+    return int(followers or 0) <= max_followers or _balanced()
+
+
+def get_follow_targets(limit: int = 50, balance: float = 0.20,
+                       max_followers: int = 400) -> list[sqlite3.Row]:
+    """Users eligible for a follow: not eliminated, not yet followed, and who
+    are EITHER small (followers <= `max_followers`, default 400) OR balanced
+    (followers and following within `balance`, default 20%). Small accounts are
+    easy to reach; balanced peers are engaging - both respond to a follow."""
+    with connect() as db:
+        return db.execute("""
+            SELECT *
+            FROM users
+            WHERE eliminated=0 AND followed=0
+              AND (followers_count <= ?
+                   OR (followers_count > 0 AND following_count > 0
+                       AND (ABS(followers_count - following_count)
+                            * 1.0 / MAX(followers_count, following_count)) <= ?))
+            ORDER BY created_at DESC LIMIT ?
+        """, (max_followers, balance, limit)).fetchall()
+
+
+def get_pending_followbacks(limit: int = 50) -> list[sqlite3.Row]:
+    """Users we've followed but who haven't followed back yet."""
+    with connect() as db:
+        return db.execute("""
+            SELECT * FROM users
+            WHERE followed=1 AND follows_you=0 AND eliminated=0
+            ORDER BY followed_at DESC LIMIT ?
+        """, (limit,)).fetchall()
 
 
 def get_events(user_id: int) -> list[sqlite3.Row]:
@@ -730,6 +817,8 @@ def read_signals_live(username: str, user_id: int | None = None, session=None) -
     _dbg(f"read_signals_live START username={username!r} user_id={user_id}")
     data = fetch_profile_page(username, session=session)
     uid = upsert_user(data)
+    if "follows_you" in data:
+        update_follows_you(username, bool(data.get("follows_you")))
     _, grams = _store_user_extra(uid, data)
     _dbg(f"read_signals_live user stored uid={uid}")
     time.sleep(random.uniform(1.5, 4.0))  # a person digests a profile before moving on
