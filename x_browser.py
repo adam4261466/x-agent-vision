@@ -996,16 +996,30 @@ _OPEN_PROFILE_MESSAGE_JS = """() => {
     for (const n of nodes) {
         if (n.offsetParent === null) continue;
         const href = (n.getAttribute('href') || '').trim();
-        if (/^\\/messages\\/(compose|new)/.test(href) || href.indexOf('/messages/compose') !== -1) {
-            n.click(); return {clicked: true, url: href};
-        }
         const aria = (n.getAttribute('aria-label') || '').toLowerCase().replace(/\\s+/g, '');
         const txt = (n.innerText || '').toLowerCase().replace(/\\s+/g, '');
-        if (aria === 'message' || aria === 'senddm' || aria === 'sendmessage' || txt === 'message') {
-            n.click(); return {clicked: true, url: href};
+        const testid = (n.getAttribute('data-testid') || '').toLowerCase();
+        const isMsgLink = /^\\/messages\\/(compose|new)/.test(href)
+            || href.indexOf('/messages/compose') !== -1;
+        const ariaMsg = aria === 'message'
+            || aria.indexOf('message@') === 0
+            || aria.indexOf('send message') === 0
+            || aria === 'sendmessage';
+        const txtMsg = txt === 'message' || txt === 'sendmessage';
+        const tidMsg = (testid.indexOf('message') !== -1 || testid.indexOf('dm') !== -1)
+            && testid.indexOf('follow') === -1 && testid.indexOf('block') === -1;
+        if (isMsgLink || ariaMsg || txtMsg || tidMsg) {
+            n.click();
+            return {clicked: true, url: href};
         }
     }
     return {clicked: false, url: ''};
+}"""
+
+_PROFILE_DM_BLOCKED_JS = """() => {
+    const t = (document.body ? document.body.innerText : '') || '';
+    if (/(can'?t send messages to this account|doesn'?t accept direct messages|dm (requests are )?closed|doesn'?t allow direct messages)/i.test(t.slice(0, 4000))) return true;
+    return false;
 }"""
 
 _SEND_CLICK_JS = """() => {
@@ -1064,32 +1078,60 @@ def _has_composer(page: Any) -> bool:
         return False
 
 
+def _profile_dm_closed(page: Any) -> bool:
+    try:
+        return bool(page.evaluate(_PROFILE_DM_BLOCKED_JS))
+    except PlaywrightError:
+        return False
+
+
 def _open_dm_composer(context, page: Any, handle: str, timeout_ms: int) -> Any:
     """Open a DM composer with @handle. Preferred route: the profile's
-    'Message' button (works even with no existing conversation). Falls back to
-    the inbox thread search."""
+    'Message' button (works even with no existing conversation), re-scanned a
+    few times because the header hydrates asynchronously. Falls back to the
+    inbox thread search."""
     handle = str(handle).strip().lstrip("@").lower()
     _goto(page, f"https://x.com/{handle}", wait_selector="main", timeout_ms=timeout_ms)
-    _human_wait(page, 1000, 2400)
-    try:
-        out = page.evaluate(_OPEN_PROFILE_MESSAGE_JS) or {}
-    except PlaywrightError:
-        out = {}
-    if out.get("clicked"):
-        _dbg(f"_open_dm_composer @{handle} profile 'Message' clicked")
+    opened = False
+    for attempt in range(8):
+        _human_wait(page, 900, 1500)   # let the profile header hydrate
+        try:
+            out = page.evaluate(_OPEN_PROFILE_MESSAGE_JS) or {}
+        except PlaywrightError:
+            out = {}
+        if out.get("clicked"):
+            opened = True
+            _dbg(f"_open_dm_composer @{handle} 'Message' clicked (attempt {attempt + 1})")
+            break
+        if _profile_dm_closed(page):
+            raise RuntimeError(
+                f"@{handle} has DMs closed - X shows no 'Message' button and a "
+                "'can't message this account' notice. They must allow DMs (or "
+                "follow you) before a first DM can be sent."
+            )
+    if opened:
         for _ in range(12):
             _human_wait(page, 700, 1200)
             if _has_composer(page):
                 _human_wait(page, 900, 1800)
                 return page
+        raise RuntimeError(
+            f"Clicked 'Message' on @{handle}'s profile but the composer never "
+            "appeared. X may be blocking this DM or the page changed layout."
+        )
     try:
         return _open_thread(context, page, handle, timeout_ms)
     except NoThreadError:
         pass
+    if _profile_dm_closed(page):
+        raise RuntimeError(
+            f"@{handle} has DMs closed - X shows no 'Message' button and no "
+            "existing conversation. Contact them with a reply instead."
+        )
     raise RuntimeError(
-        f"Could not open a DM composer for @{handle}: no 'Message' button on "
-        "their profile and no existing conversation. They likely have DMs "
-        "closed, or X restricts messaging this account."
+        f"No 'Message' button found on @{handle}'s profile and no existing "
+        "conversation. They likely have DMs closed, or X restricts messaging "
+        "this account."
     )
 
 
